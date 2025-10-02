@@ -4,8 +4,12 @@ from haversine import haversine, Unit
 import math
 from itertools import islice
 
+# Current workflow:
 # Input: panorama location and headings
-# Output: panorama ids of the three images closest to each inlet cropped and ready for annotation
+# Output: panorama ids of the three images closest to each inlet
+
+# Next steps:
+# Crop the selected panorama images and save in the designated folder
 
 def extract_inlet_location(file_path):
     """
