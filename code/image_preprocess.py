@@ -2,9 +2,10 @@ import pandas as pd
 import pymap3d as pm
 from haversine import haversine, Unit
 import math
+from itertools import islice
 
 # Input: panorama location and headings
-# Output: Threee images closest to each inlet cropped and ready for annotation
+# Output: panorama ids of the three images closest to each inlet cropped and ready for annotation
 
 def extract_inlet_location(file_path):
     """
@@ -65,7 +66,7 @@ def closest_panoramas_id(inlet_location, pano_locations):
             pano_id = pano_locations['panoramas_id']
         else:
             continue
-    return pano_id
+    return pano_id, shortest_distance
 
 def compute_heading(inlet_location, pano_location):
     """
@@ -94,29 +95,41 @@ def compute_pitch(inlet_location, pano_location):
     pitch = math.degrees(math.atan(2, distance))
     return pitch
 
-def get_multiview(pano_locations, pano_id):
+def get_multiview(pano_locations, pano_id, shortest_distance):
     """
-    Given the id of the closest panorama (pano_1) to the inlet, identify two nearby pano_ids that meet the following conditions:
-    1. At least 2 meters away from pano_1
+    Given the id of the closest panorama (centeral pano) to the inlet and its distance to the inlet, identify two nearby pano_ids that meet the following conditions:
+    1. At least 2 meters away from centeral pano
     2. Must be within 10 meters from the inlet
-    3. One greater and one less than pano_1 (i.e., one just ahead and one just behind the closest panorama)
-    Assumption: Condtion 1 is set with the asumption that panorma captures 10 images every second
+    3. One approaching and one leaving the centeral pano along the travelling direction
+    Assumption: Condtion 1 is set given that panorma captures 10 images every second and it is travelling at approximately 50 km/hr
     :pano_locations: dataframe, ids and geodetic coordinates of the panorama locations
     :param pano_id: int, id of the closest panorama to the inlet
     """
     candidate_panos = []
-    for row in pano_locations.itertuples(index = False):
-        proximity = abs(pano_id - row[0])
-        if proximity == 0:
+    central_pano_index = pano_locations[pano_locations['panoramas_id'] == pano_id].index
+    pano_approaching = []
+    pano_leaving = []
+    for row in reversed(list(islice(pano_locations.itertuples(index = False), [central_pano_index - 6], [central_pano_index]))):
+        distance_to_central_pano = haversine([row[1], row[2]], [candidate_panos[1,0], candidate_panos[2,0]], Unit.METERS)
+        distance_to_inlet = distance_to_central_pano + shortest_distance
+        if distance_to_central_pano < 2:
             continue
-        else:
-            candidate_panos.append(row[0], proximity) 
-        candidate_panos = pd.DataFrame(candidate_panos, columns="pano_id", "proximity")
-        candidate_panos.sort_values(by=['proximity'])
-
-
-        
-        
+        elif distance_to_inlet > 10:
+            continue
+        else: 
+            pano_approaching.append(row[0])
+            break
+    for row in islice(pano_locations.itertuples(index = False), [central_pano_index + 1], [central_pano_index + 7]):
+        distance_to_central_pano = haversine([row[1], row[2]], [candidate_panos[1,0], candidate_panos[2,0]], Unit.METERS)
+        distance_to_inlet = distance_to_central_pano + shortest_distance
+        if distance_to_central_pano < 2:
+            continue
+        elif distance_to_inlet > 10:
+            continue
+        else: 
+            pano_leaving.append(row[0])
+            break   
+    return [pano_approaching, pano_id, pano_leaving]
 
 if __name__ == '__main__':
     inlet_locations = extract_inlet_location(file_path="../360streetview/waterloo.csv")
