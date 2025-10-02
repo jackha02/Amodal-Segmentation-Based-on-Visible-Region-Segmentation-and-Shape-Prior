@@ -3,6 +3,8 @@ import pymap3d as pm
 from haversine import haversine, Unit
 import math
 from itertools import islice
+import shutil
+import os
 
 # Current workflow:
 # Input: panorama location and headings
@@ -25,7 +27,7 @@ def extract_inlet_location(file_path):
     Ie. input: Waterloo ==> Find the columns that share the longtitude and latitude
     """
     df = pd.read_csv(file_path)
-    inlet_locations = pd.DataFrame(df[["y", "x"]].values, columns=["latitude", "longitude"])
+    inlet_locations = pd.DataFrame(df["ASSET_TYPE", "y", "x"].values, columns=["inlet_id", "latitude", "longitude"])
     inlet_locations = inlet_locations.dropna()
     return inlet_locations
 
@@ -52,25 +54,27 @@ def panorama_location(file_path):
     pano_locations = pd.DataFrame(pano_locations, columns=['panoramas_id', 'lat', 'lon', 'alt'])
     return pano_locations
 
-def closest_panoramas_id(inlet_location, pano_locations):
+def closest_panoramas_id(inlet_locations, pano_locations):
     """
-    Get the ids of the closest panoramas to drain inlets
+    Obtain the ids of the closest panoramas for a given inlet id
     The distance between two points on the globe is calculated using haversine algorithm
     Assumption: Difference in the elevation is not considered in the haversine formula
     :param inlet_location: list of floats, latitude and longitude of the inlet
     :param pano_locations: dataframe, geodetic coordinates of the panorama
-    Returns id of the closest panorama to the inlet    
+    Returns the inlet id, id of the closest panorama, and distance between the inlet and panorama
     """
+    inlet_coordinates = inlet_locations[1,2]
     shortest_distance = []
     for row in pano_locations.itertuples(index = False):
         pano_coordinate = pano_locations(['lat, lon'])
-        distance = haversine(inlet_location, pano_coordinate)
+        distance = haversine(inlet_coordinates, pano_coordinate)
         if distance is None or distance <= shortest_distance:
             distance = shortest_distance
             pano_id = pano_locations['panoramas_id']
         else:
             continue
-    return pano_id, shortest_distance
+        return inlet_locations[0], pano_id, shortest_distance
+            
 
 def compute_heading(inlet_location, pano_location):
     """
@@ -106,13 +110,15 @@ def get_multiview(pano_locations, pano_id, shortest_distance):
     2. Must be within 10 meters from the inlet
     3. One approaching and one leaving the centeral pano along the travelling direction
     Assumption: Condtion 1 is set given that panorma captures 10 images every second and it is travelling at approximately 50 km/hr
-    :pano_locations: dataframe, ids and geodetic coordinates of the panorama locations
+    :param pano_locations: dataframe, ids and geodetic coordinates of the panorama locations
     :param pano_id: int, id of the closest panorama to the inlet
+    :param shortest_distance: flaoat, distance between the the panorana 
     """
     candidate_panos = []
     central_pano_index = pano_locations[pano_locations['panoramas_id'] == pano_id].index
     pano_approaching = []
     pano_leaving = []
+    multi_view = []
     for row in reversed(list(islice(pano_locations.itertuples(index = False), [central_pano_index - 6], [central_pano_index]))):
         distance_to_central_pano = haversine([row[1], row[2]], [candidate_panos[1,0], candidate_panos[2,0]], Unit.METERS)
         distance_to_inlet = distance_to_central_pano + shortest_distance
@@ -132,12 +138,50 @@ def get_multiview(pano_locations, pano_id, shortest_distance):
             continue
         else: 
             pano_leaving.append(row[0])
-            break   
-    return [pano_approaching, pano_id, pano_leaving]
+            break
+    multi_view.append[pano_approaching, pano_id, pano_leaving]  
+    return multi_view
+
+def save_images(multi_view, inlet_id, input_path, output_path):
+    """
+    For a set of three panorama ids for the drain inlet, extract and save images in a seperate folder
+    Assumption: All panorama images are saved in the folder with panorama ids as their names
+    :param multi_view: list of floats, three panorama ids for the inlet
+    :param input_path: file path, directory to raw panorama images
+    :param output_path: file path, directory to where the multiview images will be saved 
+    """
+    image_extensions = ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff')
+    filename_approaching = str(multi_view[0])
+    for 
+    if filename_approaching
+
+
+
+    if multi_view[0].endswith(image_extensons) in os.listdir(input_path):
+        image_filename_approaching = "approaching_cb_{inlet_id}"
+
+        shutil.move
+
+    image_filename_approaching = "approaching_cb_{inlet_id}"
+    image_filename_central = "central_cb_{inlet_id}"
+    image_filename_leaving = "leaving_cb_{inlet_id}"
+
+    try:
+        shutil.move
+    
+    
+
 
 if __name__ == '__main__':
-    inlet_locations = extract_inlet_location(file_path="../360streetview/waterloo.csv")
-    camera_locations = panorama_location(file_path="../360streetview/poses.csv")
+    inlet_locations = extract_inlet_location(file_path="../waterloo.csv")
+    pano_locations = panorama_location(file_path="../poses.csv")
+    raw_images = "../360streetview/raw"
+    inlet_images = "../360streetview/filtered"
+    for row in inlet_locations.itertuples(inded = False):
+        inlet_id, closest_panorama_id, shortest_distance = closest_panoramas_id(row[0], pano_locations)
+        multi_view = get_multiview(pano_locations, closest_panorama_id, shortest_distance)
+        save_image(multi_view, raw_images, inlet_images)_
+    
     
 
 
