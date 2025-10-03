@@ -8,10 +8,7 @@ import os
 
 # Current workflow:
 # Input: panorama location and headings
-# Output: panorama ids of the three images closest to each inlet
-
-# Next steps:
-# Crop the selected panorama images and save in the designated folder
+# Output: move the panorama images closest to each inlet into a designated output folder for model input
 
 def extract_inlet_location(file_path):
     """
@@ -151,26 +148,22 @@ def save_images(multi_view, inlet_id, input_path, output_path):
     :param output_path: file path, directory to where the multiview images will be saved 
     """
     image_extensions = ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff')
-    filename_approaching = str(multi_view[0])
-    for 
-    if filename_approaching
-
-
-
-    if multi_view[0].endswith(image_extensons) in os.listdir(input_path):
-        image_filename_approaching = "approaching_cb_{inlet_id}"
-
-        shutil.move
-
-    image_filename_approaching = "approaching_cb_{inlet_id}"
-    image_filename_central = "central_cb_{inlet_id}"
-    image_filename_leaving = "leaving_cb_{inlet_id}"
-
-    try:
-        shutil.move
-    
-    
-
+    for view in multi_view:
+        if multi_view[0].endswith(image_extensions) in os.listdir(input_path):
+            try:
+                shutil.move(os.path.join(input_path, view.image_extensions), os.path.join(output_path, f"{inlet_id}_{approaching}.{image_extensions}"))
+            except FileNotFoundError:
+                pass
+        if multi_view[1].endswith(image_extensions) in os.listdir(input_path):
+            try:
+                shutil.move(os.path.join(input_path, view.image_extensions), os.path.join(output_path, f"{inlet_id}_{central}.{image_extensions}"))
+            except FileNotFoundError:
+                pass
+        if multi_view[2].endswith(image_extensions) in os.listdir(input_path):
+            try:
+                shutil.move(os.path.join(input_path, view.image_extensions), os.path.join(output_path, f"{inlet_id}_{leaving}.{image_extensions}"))
+            except FileNotFoundError:
+                pass
 
 if __name__ == '__main__':
     inlet_locations = extract_inlet_location(file_path="../waterloo.csv")
@@ -180,7 +173,7 @@ if __name__ == '__main__':
     for row in inlet_locations.itertuples(inded = False):
         inlet_id, closest_panorama_id, shortest_distance = closest_panoramas_id(row[0], pano_locations)
         multi_view = get_multiview(pano_locations, closest_panorama_id, shortest_distance)
-        save_image(multi_view, raw_images, inlet_images)_
+        save_image(multi_view, raw_images, inlet_images)
     
     
 
