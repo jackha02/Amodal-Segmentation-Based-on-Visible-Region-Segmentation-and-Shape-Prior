@@ -6,10 +6,6 @@ from itertools import islice
 import shutil
 import os
 
-# Current workflow:
-# Input: panorama location and headings
-# Output: move the panorama images closest to each inlet into a designated output folder for model input
-
 def extract_inlet_location(file_path):
     """
     Extract latitude and longtitude of drain inlets from the city database
@@ -68,33 +64,6 @@ def closest_panoramas_id(inlet_locations, pano_locations):
         else:
             continue
         return inlet_locations[0], pano_id, shortest_distance
-            
-def compute_heading(inlet_location, pano_location):
-    """
-    Compute compass heading (0 to 360 degrees) from panorama center to drain inlet
-    :param inlet_location: list of floats, latitude and longitude of the inlet
-    :param pano_locations: list of floats, latitude and longitude of the panorama
-    Returns heading from panorama center to drain inlet
-    """
-    inlet_lat, inlet_long = inlet_location[1], inlet_location[2]
-    pano_lat, pano_long = pano_location[1], pano_location[2]
-    dx = (inlet_long - pano_long) * math.cos(math.radians((pano_lat + inlet_lat) / 2))
-    dy = inlet_lat - pano_lat    
-    heading = math.degrees(math.atan2(dx, dy)) % 360
-    return heading
-
-def compute_pitch(inlet_location, pano_location):
-    """
-    Compute the pitch adjustment (-90 to 90 degrees) required to position the inlet at the center of the panorama
-    Assumption: The haversine between inlet and panorama effectively becomes a straight line due to a short distance
-    The height of the panorama relative to the ground is fixed at 2 meters
-    :param inlet_location: list of floats, latitude and longitude of the inlet
-    :param camera_locations: list of floats, latitude and longitude of the panorama
-    Returns pitch from panorama center to drain inlet
-    """
-    distance = haversine(inlet_location, pano_location, Unit.METERS)
-    pitch = math.degrees(math.atan(2 / distance))
-    return pitch
 
 def get_multiview(pano_locations, pano_id, shortest_distance):
     """
@@ -107,7 +76,7 @@ def get_multiview(pano_locations, pano_id, shortest_distance):
     :param pano_id: int, id of the closest panorama to the inlet
     :param shortest_distance: flaoat, distance between the the panorana 
     """
-    central_pano_index = pano_locations[pano_locations['panoramas_id'] == pano_id].index[0]
+    central_pano_index = pano_locations[pano_locations['panoramas_id'] == pano_id].index(0)
     central_lat, central_lon = pano_locations.iloc[central_pano_index, 1:3]
     pano_approaching = []
     pano_leaving = []
@@ -135,9 +104,38 @@ def get_multiview(pano_locations, pano_id, shortest_distance):
     multi_view.append([pano_approaching, pano_id, pano_leaving])  
     return multi_view
 
+def compute_heading_pitch(inlet_location, pano_location):
+    """
+    Compute compass heading (0 to 360 degrees) from panorama center to drain inlet
+    Assumption: The haversine between inlet and panorama effectively becomes a straight line due to a short distance    
+    :param inlet_location: list of floats, latitude and longitude of the inlet
+    :param pano_locations: list of floats, latitude and longitude of the panorama
+    Returns heading and heading from panorama center to drain inlet
+    """
+    inlet_lat, inlet_long = inlet_location[1], inlet_location[2]
+    pano_lat, pano_long = pano_location[1], pano_location[2]
+    dx = (inlet_long - pano_long) * math.cos(math.radians((pano_lat + inlet_lat) / 2))
+    dy = inlet_lat - pano_lat    
+    heading = math.degrees(math.atan2(dx, dy)) % 360
+    distance = haversine(inlet_location, pano_location, Unit.METERS)
+    pitch = math.degrees(math.atan(2 / distance))
+    return heading, pitch
+
+def cropping_properties(inlet_location, multi_view):
+    """
+    To calculate the heading and pitch to center the drain inlet at the center of the rectilinear image
+    :param inlet_location: list of floats, latitude and longitude of the inlet
+    :param multi_view: list of floats, three panorama ids for the inlet
+    """
+    cropping_properties = []
+    for view in multi_view:
+            heading, pitch = compute_heading_pitch(inlet_location, view)
+            cropping_properties.append([f"{view}", heading, pitch])
+    return cropping_properties
+
 def save_images(multi_view, inlet_id, input_path, output_path):
     """
-    For a set of three panorama ids for the drain inlet, extract and save images in a seperate folder
+    Given a set of three panorama ids for the drain inlet, extract and save images in a seperate folder
     Assumption: All panorama images are saved in the folder with panorama ids as their names
     :param multi_view: list of floats, three panorama ids for the inlet
     :param input_path: file path, directory to raw panorama images
@@ -145,7 +143,7 @@ def save_images(multi_view, inlet_id, input_path, output_path):
     """
     image_extensions = 'jpg'
     approaching, center, leaving = multi_view
-    for label, pano_id in zip(['approaching', 'center', 'leaving'], approaching, center, leaving):
+    for label, pano_id in (zip(['approaching', 'center', 'leaving'], approaching, center, leaving)):
         input = os.path.join(input_path, f"{pano_id}.{image_extensions}")
         output = os.path.join(output_path, f"{inlet_id}_{label}.{image_extensions}")
         if os.path.exists(input):
@@ -155,18 +153,24 @@ def save_images(multi_view, inlet_id, input_path, output_path):
                 pass       
 
 if __name__ == '__main__':
-    inlet_locations = extract_inlet_location(file_path="../360streetview/waterloo.csv")
-    pano_locations = panorama_location(file_path="../360streetview/poses.csv")
-    raw_images = "../360streetview/pano_images/raw"
-    inlet_images = "../360streetview/pano_images/filtered"
+    inlet_data = os.path.join(os.path.dirname(__file__), 'waterloo.csv')
+    pano_data = os.path.join(os.path.dirname(__file__), 'poses.csv')
+    raw_images = os.path.join(os.path.dirname(__file__), 'pano_images', 'raw')
+    filtered_images = os.path.join(os.path.dirname(__file__), 'pano_images', 'filtered')
+    heading_pitch_path = os.path.join(os.path.dirname(__file__), 'cropping_properties.csv') 
+
+    inlet_locations = extract_inlet_location(inlet_data)
+    pano_locations = panorama_location(pano_data)
+
+    heading_pitch = []
     for row in inlet_locations.itertuples(index = False):
         inlet_id, closest_panorama_id, shortest_distance = closest_panoramas_id(row, pano_locations)
         multi_view = get_multiview(pano_locations, closest_panorama_id, shortest_distance)
-        save_images(multi_view, inlet_id, raw_images, inlet_images)
+        heading_pitch.append(cropping_properties(row[1:4], multi_view))
+        save_images(multi_view, inlet_id, raw_images, filtered_images)
+    df = pd.DataFrame(heading_pitch, columns = ['pano_id', 'heading', 'pitch'])     
+    df.to_csv(heading_pitch_path, index = False)
     
-    
-
-
 
 
 
