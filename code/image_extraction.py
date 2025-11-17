@@ -1,10 +1,12 @@
 import pandas as pd
 import pymap3d as pm
+from sklearn.neighbors import BallTree
 from haversine import haversine, Unit
 import math
 from itertools import islice
 import shutil
 import os
+import numpy as np
 
 def extract_inlet_location(file_path):
     """
@@ -20,7 +22,7 @@ def extract_inlet_location(file_path):
     Ie. input: Waterloo ==> Find the columns that share the longtitude and latitude
     """
     df = pd.read_csv(file_path)
-    inlet_locations = pd.DataFrame(df[["ASSET_TYPE", "y", "x"]].values, columns=["inlet_id", "latitude", "longitude"])
+    inlet_locations = pd.DataFrame(df[["OBJECTID", "y", "x"]].values, columns=["inlet_id", "lat", "lon"])
     inlet_locations = inlet_locations.dropna()
     return inlet_locations
 
@@ -34,36 +36,35 @@ def panorama_location(file_path):
     Returns a geodetic coordinates of the panorama locations
     """
     df = pd.read_csv(file_path, sep=' ')
-    lat0, lon0, h0 = df.iloc[0, 1:4]
-    pano_locations = [[df.iloc[0, 0], lat0, lon0, h0]]
-    for row in islice(df.itertuples(), 1, None):
-        east, north, up = [row[1], row[2], row[3]]
-        lat0, lon0, h0 = pano_locations[-1][1:4]
-        lat, lon, alt = pm.enu2geodetic(east, north, up, lat0, lon0, h0)
-        pano_locations.append([row[0], lat, lon, alt])
-    pano_locations = pd.DataFrame(pano_locations, columns=['panoramas_id', 'lat', 'lon', 'alt'])
+    pano_locations = df.iloc[:, 0:4].copy()
+    pano_locations.columns = ['panoramas_id', 'lat', 'lon', 'alt']
     return pano_locations
 
 def closest_panoramas_id(inlet_locations, pano_locations):
     """
-    Obtain the ids of the closest panoramas for a given inlet id
+    Iterates through all inlet locations and finds the closest panoramam id
     The distance between two points on the globe is calculated using haversine algorithm
     Assumption: Difference in the elevation is not considered in the haversine formula
     :param inlet_location: list of floats, latitude and longitude of the inlet
     :param pano_locations: dataframe, geodetic coordinates of the panorama
     Returns the inlet id, id of the closest panorama, and distance between the inlet and panorama
     """
-    inlet_coordinates = [inlet_locations[1], inlet_locations[2]]
-    shortest_distance = float('inf')
-    for row in pano_locations.itertuples(index = False):
-        pano_coordinate = [row[1], row[2]]
-        distance = haversine(inlet_coordinates, pano_coordinate)
-        if distance is None or distance <= shortest_distance:
-            distance = shortest_distance
-            pano_id = row[0]
-        else:
-            continue
-        return inlet_locations[0], pano_id, shortest_distance
+
+    inlet_coordinate = np.array([[inlet_locations.lat, inlet_locations.lon]])
+    pano_coordinate = np.array([[pano_locations.lat, pano_locations.lon]])
+    pair = []
+    for i in range(len(inlet_coordinate)): 
+        # Convert the coordaintes into radians for BallTree
+        inlet_rad = np.radians(inlet_coordinate[i])
+        pano_rad = np.radians(pano_coordinate[i])
+        tree = BallTree(inlet_rad, metric='haversine')
+        dist_rad, index = tree.query(pano_rad, k=1)
+        dist_m = float(dist_rad[0][0]*6371000)
+        if dist_m < 3:
+            nearest_index = index[0][0]
+            pano_id = float(pano_locations.iloc[nearest_index]['panoramas_id'])
+            pair.append(inlet_locations[row, 1:3], pano_id, dist_m)
+    return pair
 
 def get_multiview(pano_locations, pano_id, shortest_distance):
     """
