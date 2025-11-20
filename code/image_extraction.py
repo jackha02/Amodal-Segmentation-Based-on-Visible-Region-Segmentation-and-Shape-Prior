@@ -22,7 +22,7 @@ def extract_inlet_location(file_path):
     Ie. input: Waterloo ==> Find the columns that share the longtitude and latitude
     """
     df = pd.read_csv(file_path)
-    inlet_locations = pd.DataFrame(df[["OBJECTID", "y", "x"]].values, columns=["inlet_id", "lat", "lon"])
+    inlet_locations = pd.DataFrame(df[["ASSET_ID", "y", "x"]].values, columns=["inlet_id", "lat", "lon"])
     inlet_locations = inlet_locations.dropna()
     return inlet_locations
 
@@ -49,22 +49,22 @@ def closest_panoramas_id(inlet_locations, pano_locations):
     :param pano_locations: dataframe, geodetic coordinates of the panorama
     Returns the inlet id, id of the closest panorama, and distance between the inlet and panorama
     """
-
-    inlet_coordinate = np.array([[inlet_locations.lat, inlet_locations.lon]])
-    pano_coordinate = np.array([[pano_locations.lat, pano_locations.lon]])
-    pair = []
-    for i in range(len(inlet_coordinate)): 
-        # Convert the coordaintes into radians for BallTree
-        inlet_rad = np.radians(inlet_coordinate[i])
-        pano_rad = np.radians(pano_coordinate[i])
-        tree = BallTree(inlet_rad, metric='haversine')
-        dist_rad, index = tree.query(pano_rad, k=1)
+    # Convert the coordaintes into radians for BallTree
+    inlet_deg = inlet_locations[['lat', 'lon']].to_numpy()
+    pano_deg  = pano_locations[['lat', 'lon']].to_numpy()
+    inlet_rad = np.radians(inlet_deg)
+    pano_rad  = np.radians(pano_deg)
+    tree = BallTree(pano_rad, metric='haversine')
+    results = []
+    for i in range(len(inlet_rad)):    
+        dist_rad, index = tree.query(inlet_rad[i].reshape(1,-1), k=1)
         dist_m = float(dist_rad[0][0]*6371000)
-        if dist_m < 3:
+        if dist_m < 100:
             nearest_index = index[0][0]
             pano_id = float(pano_locations.iloc[nearest_index]['panoramas_id'])
-            pair.append(inlet_locations[row, 1:3], pano_id, dist_m)
-    return pair
+            inlet_id = float(inlet_locations.iloc[i]['inlet_id'])
+            results.append([inlet_id, pano_id, dist_m])
+    return results
 
 def get_multiview(pano_locations, pano_id, shortest_distance):
     """
