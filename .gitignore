@@ -1,2 +1,5 @@
-input_data/
+raw_data/
 output/
+dataset/
+pre_datasplit/
+runs/
