@@ -5,5 +5,5 @@ val: val/images
 # Classes
 names:
   0: clean
-  1: partial
-  2: critical
+  1: clogged 
+

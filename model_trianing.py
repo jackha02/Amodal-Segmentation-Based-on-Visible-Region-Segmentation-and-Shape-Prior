@@ -9,9 +9,9 @@ import random
 import shutil
 
 # Directory to images, labels, datasets
-img_dir = os.path.join(os.path.dirname(__file__), "../pre_datasplit/images")
-label_dir = os.path.join(os.path.dirname(__file__), "../pre_datasplit/labels")
-dataset_dir = os.path.join(os.path.dirname(__file__), "../dataset")
+img_dir = os.path.join(os.path.dirname(__file__), "pre_datasplit/images")
+label_dir = os.path.join(os.path.dirname(__file__), "pre_datasplit/labels")
+dataset_dir = os.path.join(os.path.dirname(__file__), "dataset")
 train_dir = os.path.join(dataset_dir, "train/images")
 val_dir = os.path.join(dataset_dir, "val/images")
     
@@ -61,6 +61,7 @@ def data_split(img_dir, label_dir, dataset_dir, split_ratio):
 
 data_split(img_dir, label_dir, dataset_dir, split_ratio)
 
+"""
 # Transforming steps using albumentations for tensor conversion
 train_transform = A.Compose([
     A.RandomCrop(width=640, height=640),
@@ -102,6 +103,6 @@ model.train(data="../dataset/data.yaml", epochs=epochs)
 results = model.val()
 # Optimize for deploymnet 
 model.export(format='onnx')
-
+"""
 
  
