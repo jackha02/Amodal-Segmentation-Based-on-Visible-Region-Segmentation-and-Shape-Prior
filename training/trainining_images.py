@@ -11,6 +11,7 @@ from tqdm import tqdm
 from PIL import Image
 from scipy.ndimage import map_coordinates
 import cv2
+import random
 
 def extract_inlet_location(file_path):
     """
@@ -39,17 +40,36 @@ def panorama_location(file_path):
     pano_locations.columns = ['panoramas_id', 'lat', 'lon', 'alt']
     return pano_locations
 
-def pano_heading(file_path):
+def pano_heading(folder_path):
     """
     Determines the panorama heading by calculating the GPS bearing and adjusting for the camera's local boresight offset using Optical Flow.
     :param img1_path, img2_path: Paths to two consecutive panorama images
     :param lat1, lon1, lat2, lon2: Geodetic coordinates of the two panoramas
     Returns: float, the absolute heading of the driving direction (0-360)
     """
-    Randomly select 10 sets of 2 consecutive images from the file_path
-    Detect features to track using goodFeatures to TRack
-    
+    # Randomly select 10 sets of 2 consecutive images from the image folder
+    image_set = [] 
+    extensions = {'.jpg', '.jpeg', '.png'}
+    images = [f for f in folder_path.iterdir() if f.suffix.lower() in extensions]
+    # Assume that all filenames are a float
+    images.sort(key=lambda x: float(x.stem))
+    while len(image_set)<=10:
+        img1 = random.choice(range(1, len(images)-1))
+        img1_index = images.index(img1)
+        img2_index = img1_index + 1
+        img2 = images(img2_index)
+        image_set.append([img1, img2])
+    # Use optical flow across the reason to 
+    flow = cv2.calcOpticalFlowFarneback(img1, img2, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+    magnitude, _ = cv2.cartToPolar(flow[..., 0], flow[...,1])
+    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(mag)
+    # Calculate the offset between the image center and vehicle travelling direction
+    image_width = img1.shape[1]
+    center_x = image_width / 2
+    foe_x = min_loc[0]
 
+    pixel_offset = foe_x - center_x
+    angular_offset_u = (pixel_offset / image_width) * 360
 
 def closest_panoramas_id(inlet_locations, pano_locations):
     """
