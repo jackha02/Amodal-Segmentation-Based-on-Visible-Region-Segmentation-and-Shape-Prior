@@ -23,41 +23,6 @@ num_workers = os.cpu_count()
 # Other input parameters
 split_ratio = 0.8
 
-def data_split(img_dir, label_dir, dataset_dir, split_ratio):
-    """
-    Split the dataset into train and validation folders
-    Assumption: test sets are not considered
-    :param img_dir, directory to the custom image dataset
-    :param label_dir, directory to the image labels
-    :param dataset_dir, directory to where the split dataset will be stored
-    :param split_ratio, ratio between train and validation 
-    """
-    img_filenames = sorted([f for f in os.listdir(img_dir)])
-    label_filenames = sorted([f for f in os.listdir(label_dir)])
-    # Count the number of files in the folder
-    total = len(img_filenames)
-    # Create an array with a range of numbers starting at 1 to size of the folder
-    index_list = list(range(0, total))
-    random.shuffle(index_list)
-    split_point = int(split_ratio * total)
-    train_index = index_list[:split_point]
-    val_index = index_list[split_point:]
-    # Using the index in the previous steps, split the images and labels accordingly to the coresponding folder
-    train_img = os.path.join(dataset_dir, "train/images")
-    train_lab = os.path.join(dataset_dir, "train/labels")
-    val_img = os.path.join(dataset_dir, "val/images")
-    val_lab = os.path.join(dataset_dir, "val/labels")
-    os.makedirs(train_img, exist_ok=True)
-    os.makedirs(train_lab, exist_ok=True)
-    os.makedirs(val_img, exist_ok=True)
-    os.makedirs(val_lab, exist_ok=True)
-    for idx in train_index:
-        shutil.copy(os.path.join(img_dir, img_filenames[idx]), train_img)
-        shutil.copy(os.path.join(label_dir, label_filenames[idx]), train_lab)
-    # Copy validation samples
-    for idx in val_index:
-        shutil.copy(os.path.join(img_dir, img_filenames[idx]), val_img)
-        shutil.copy(os.path.join(label_dir, label_filenames[idx]), val_lab)
 
 data_split(img_dir, label_dir, dataset_dir, split_ratio)
 
