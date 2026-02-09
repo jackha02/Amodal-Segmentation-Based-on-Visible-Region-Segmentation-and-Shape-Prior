@@ -14,6 +14,7 @@ import tqdm
 import glob
 import labelbox as lb
 
+
 def extract_inlet_location(file_path):
     """
     Extract latitude and longtitude of drain inlets from the city database
@@ -37,7 +38,7 @@ def panorama_location(file_path):
     Returns a geodetic coordinates of the panorama locations
     """
     df = pd.read_csv(file_path, sep=' ')
-    pano_locations = df.iloc[:, 0:4].copy()
+    pano_locations = df.iloc[:, [0, 5, 4, 6]].copy()
     pano_locations.columns = ['panoramas_id', 'lat', 'lon', 'alt']
     return pano_locations
 
@@ -67,13 +68,14 @@ def closest_panoramas_id(inlet_locations, pano_locations):
             results.append([inlet_id, pano_id, dist_m])
     return results
 
-def get_multiview(pano_locations, pano_id, shortest_distance):
+def get_multiview(inlet_locations, pano_locations, pano_id, shortest_distance):
     """
     Given the id of the closest panorama (centeral pano) to the inlet and its distance to the inlet, identify two nearby pano_ids that meet the following conditions:
     1. At least 2 meters away from centeral pano
     2. Must be within 10 meters from the inlet
     3. One approaching and one leaving the centeral pano along the travelling direction
     Assumption: Condtion 1 is set given that panorma captures 10 images every second and it is travelling at approximately 50 km/hr
+    :param inlet_locations: list of floats, latitude and longitude of the inlet 
     :param pano_locations: dataframe, ids and geodetic coordinates of the panorama locations
     :param pano_id: int, id of the closest panorama to the inlet
     :param shortest_distance: float, distance between the the panorama
@@ -84,53 +86,44 @@ def get_multiview(pano_locations, pano_id, shortest_distance):
     pano_approaching = []
     pano_leaving = []
     multi_view = []
-    for row in reversed(list(islice(pano_locations.itertuples(index = False), central_pano_index - 6, central_pano_index))):
+    for row in islice(pano_locations.itertuples(index = False), central_pano_index - 1, central_pano_index - 6):
         distance_to_central_pano = haversine([row[1], row[2]], [central_lat, central_lon], Unit.METERS)
-        distance_to_inlet = distance_to_central_pano + shortest_distance
-        if distance_to_central_pano < 2:
-            continue
-        elif distance_to_inlet > 10:
-            continue
+        distance_to_inlet = haversine([row[1], row[2]], [inlet_locations[0], inlet_locations[1]], Unit.METERS)
+        if distance_to_central_pano >= 2:
+            if distance_to_inlet <= 10:
+                pano_approaching = row[0]
+                break
         else: 
-            pano_approaching = row[0]
-            break
-    for row in islice(pano_locations.itertuples(index = False), central_pano_index + 1, central_pano_index + 7):
+            start_idx +=1
+            continue
+    for row in islice(pano_locations.itertuples(index = False), central_pano_index + 1, central_pano_index + 6):
         distance_to_central_pano = haversine([row[1], row[2]], [central_lat, central_lon], Unit.METERS)
         distance_to_inlet = distance_to_central_pano + shortest_distance
         if distance_to_central_pano < 2:
-            continue
-        elif distance_to_inlet > 10:
-            continue
+            if distance_to_inlet > 10:
+                continue
         else: 
             pano_leaving = row[0]
             break
     multi_view = [pano_approaching, pano_id, pano_leaving]
     return multi_view
 
-def panorama_heading(u, width):
-    """
-    Determines the panorama heading by calculating the GPS bearing and adjusting for the camera's local boresight offset using Optical Flow
-    :u: float, the horizontal pixel coordinate in the panorama image
-    :image_size: tuple, the size of the panorama image (width, height)
-    Returns the panorama heading in degrees
-    """
-    pano_heading =(u / width)%360
-    return pano_heading
-
-def compute_heading_pitch(camera_height, inlet_location, pano_location):
+def compute_heading_pitch(camera_height, inlet_location, view_loc):
     """
     Compute compass heading (0 to 360 degrees) from panorama center to drain inlet
     Assumption: The haversine between inlet and panorama effectively becomes a straight line due to a short distance  
     :param inlet_location: list of floats, latitude and longitude of the inlet
-    :param pano_locations: list of floats, latitude and longitude of the panorama
+    :param view_loc: list of floats, latitude and longitude of the panorama
     Returns heading and heading from panorama center to drain inlet
     """
-    inlet_lat, inlet_long = inlet_location[1], inlet_location[2]
-    pano_lat, pano_long = pano_location[1], pano_location[2]
+    inlet_lat, inlet_long = inlet_location[0], inlet_location[1]
+    pano_lat, pano_long = view_loc[0], view_loc[1]
+    inlet_loc = (inlet_lat, inlet_long)
+    pano_loc = (pano_lat, pano_long)
     dx = (inlet_long - pano_long) * math.cos(math.radians((pano_lat + inlet_lat) / 2))
     dy = inlet_lat - pano_lat    
     heading = math.degrees(math.atan2(dx, dy))
-    distance = haversine(inlet_location, pano_location, Unit.METERS)
+    distance = haversine(inlet_loc, pano_loc, Unit.METERS)
     pitch = np.arctan2(camera_height, distance)
     return heading, pitch
 
@@ -282,8 +275,8 @@ def data_split(img_dir, label_dir, dataset_dir, validation_ratio, testing_ratio)
 if __name__ == '__main__':
     # File paths:
     inlet_data = os.path.join(os.path.dirname(__file__), '..', 'raw_data', 'waterloo.csv')
-    pano_data = os.path.join(os.path.dirname(__file__), '..', 'raw_data', 'poses.csv')
-    raw_images = os.path.join(os.path.dirname(__file__), '..', 'raw_data', 'images')
+    pano_data = os.path.join(os.path.dirname(__file__), '..', 'raw_data', 'laurelwood1', 'camera_poses_transformed.txt')
+    raw_images = os.path.join(os.path.dirname(__file__), '..', 'raw_data', 'laurelwood1', 'images')
     inlet_images = os.path.join(os.path.dirname(__file__), '..', 'filtered_data', 'filtered')
     cropping_properties_data = os.path.join(os.path.dirname(__file__), '..', 'filtered_data', 'cropping_properties.csv')
     training_images = os.path.join(os.path.dirname(__file__), '..', 'pre_datasplit', 'images') 
@@ -291,36 +284,33 @@ if __name__ == '__main__':
     dataset_dir = os.path.join(os.path.dirname(__file__), '..', 'dataset', 'train')
 
     # Panorama parameters:
-    FOV = 90
-    input_size = [2048, 1024]
-    output_size = [640, 640]
-    camera_height = 1.5  # height of the camera in meters
-    lidar_offset = 461  # horizontal pixel coordinate from the center of the panorama
-
-    # Panorama heading calculation
-    vehicle_heading = panorama_heading(lidar_offset, input_size[0])
-    print(f"Calculated Vehicle Heading: {vehicle_heading}")
-
+    FOV = 120
+    camera_height = 2.1  # height of the camera in meters
+    vehicle_heading = 2850  # horizontal pixel coordinate from the center of the panorama
+    
     # Extracting panorama images closest to the inlet
-    inlet_locations = extract_inlet_location(inlet_data)
+    inlet_properties = extract_inlet_location(inlet_data)
     pano_locations = panorama_location(pano_data)
-    matches = closest_panoramas_id(inlet_locations, pano_locations)
+    matches = closest_panoramas_id(inlet_properties, pano_locations)
 
     # Calculate rectilinear cropping properties and save multiview images
     heading_pitch = []
     for inlet_id, closest_panorama_id, shortest_distance in matches:
-        inlet_row = inlet_locations[inlet_locations['inlet_id'] == inlet_id].iloc[0]
-        inlet_loc = (inlet_row['lat'], inlet_row['lon'])
-        multi_view = get_multiview(pano_locations, closest_panorama_id, shortest_distance)
-        heading_pitch.extend(cropping_properties(vehicle_heading, camera_height, inlet_id, inlet_loc, multi_view, pano_locations))
+        inlet_index = inlet_properties[inlet_properties['inlet_id'] == inlet_id].index[0]
+        inlet_locations = inlet_properties.iloc[inlet_index, 1:3]
+        multi_view = get_multiview(inlet_locations, pano_locations, closest_panorama_id, shortest_distance)
+        print(multi_view)
+        heading_pitch.extend(cropping_properties(vehicle_heading, camera_height, inlet_id, inlet_locations, multi_view, pano_locations))
         save_images(multi_view, inlet_id, raw_images, inlet_images)
     df = pd.DataFrame(heading_pitch, columns = ['filename', 'heading', 'pitch'])     
     df.to_csv(cropping_properties_data, index = False)
-
+    
+    """
     # Save cropped rectilinear images in pre_datasplit/images folder
     df = pd.read_csv(cropping_properties_data)
     if not os.path.exists(training_images):
         os.makedirs(training_images)
+    
 
     # Extract the panorama ID from image name, and find the corresponding heading and pitch from the cropping properties dataframe    
     for image_name in tqdm(os.listdir(inlet_images)):
@@ -341,4 +331,5 @@ if __name__ == '__main__':
 
     # Split the data into training and validation folders
     split_ratio = 0.8
-    data_split(training_images, training_labels, dataset_dir, validation_ratio=0.1, testing_ratio=0.1)
+    data_split(training_images, training_labels, dataset_dir, validation_ratio=0.1, testing_ratio=0.1)  
+    """

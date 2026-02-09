@@ -3,3 +3,6 @@ output/
 dataset/
 pre_datasplit/
 testing/
+code/test.py
+archive/
+filtered_data/
