@@ -10,9 +10,7 @@ import numpy as np
 from PIL import Image
 from scipy.ndimage import map_coordinates
 import cv2 
-import tqdm
-import glob
-import labelbox as lb
+from pathlib import Path
 
 
 def extract_inlet_location(file_path):
@@ -44,9 +42,9 @@ def panorama_location(file_path):
 
 def closest_panoramas_id(inlet_locations, pano_locations):
     """
-    Iterates through all inlet locations and finds the closest panoramam id
+    Iterates through all inlet locations and finds the closest panorama id
     The distance between two points on the globe is calculated using haversine algorithm
-    Assumption: Difference in the elevation is not considered in the haversine formula
+    Assumption: Difference in the elevation is omitted in the haversine formula
     :param inlet_location: list of floats, latitude and longitude of the inlet
     :param pano_locations: dataframe, geodetic coordinates of the panorama
     Returns the inlet id, id of the closest panorama, and distance between the inlet and panorama
@@ -59,20 +57,20 @@ def closest_panoramas_id(inlet_locations, pano_locations):
     tree = BallTree(pano_rad, metric='haversine')
     results = []
     for i in range(len(inlet_rad)):    
-        dist_rad, index = tree.query(inlet_rad[i].reshape(1,-1), k=1)
-        dist_m = float(dist_rad[0][0]*6371000)
-        if dist_m < 100:
+        dist_rad, index = tree.query(inlet_rad[i].reshape(1,-1), k=1) # finds the closest panorama 
+        dist_m = float(dist_rad[0][0]*6371000) # multiply the radians by radius of the earth to convert to meters
+        if dist_m < 10:
             nearest_index = index[0][0]
             pano_id = float(pano_locations.iloc[nearest_index]['panoramas_id'])
-            inlet_id = float(inlet_locations.iloc[i]['inlet_id'])
+            inlet_id = int(inlet_locations.iloc[i]['inlet_id'])
             results.append([inlet_id, pano_id, dist_m])
     return results
 
-def get_multiview(inlet_locations, pano_locations, pano_id, shortest_distance):
+def get_multiview(inlet_locations, pano_locations, pano_id):
     """
     Given the id of the closest panorama (centeral pano) to the inlet and its distance to the inlet, identify two nearby pano_ids that meet the following conditions:
     1. At least 2 meters away from centeral pano
-    2. Must be within 10 meters from the inlet
+    2. Must be within 15 meters from the inlet
     3. One approaching and one leaving the centeral pano along the travelling direction
     Assumption: Condtion 1 is set given that panorma captures 10 images every second and it is travelling at approximately 50 km/hr
     :param inlet_locations: list of floats, latitude and longitude of the inlet 
@@ -83,30 +81,22 @@ def get_multiview(inlet_locations, pano_locations, pano_id, shortest_distance):
     """
     central_pano_index = pano_locations[pano_locations['panoramas_id'] == pano_id].index[0]
     central_lat, central_lon = pano_locations.iloc[central_pano_index, 1:3]
-    pano_approaching = []
-    pano_leaving = []
-    multi_view = []
-    for row in islice(pano_locations.itertuples(index = False), central_pano_index - 1, central_pano_index - 6):
-        distance_to_central_pano = haversine([row[1], row[2]], [central_lat, central_lon], Unit.METERS)
-        distance_to_inlet = haversine([row[1], row[2]], [inlet_locations[0], inlet_locations[1]], Unit.METERS)
-        if distance_to_central_pano >= 2:
-            if distance_to_inlet <= 10:
-                pano_approaching = row[0]
-                break
-        else: 
-            start_idx +=1
-            continue
-    for row in islice(pano_locations.itertuples(index = False), central_pano_index + 1, central_pano_index + 6):
-        distance_to_central_pano = haversine([row[1], row[2]], [central_lat, central_lon], Unit.METERS)
-        distance_to_inlet = distance_to_central_pano + shortest_distance
-        if distance_to_central_pano < 2:
-            if distance_to_inlet > 10:
-                continue
-        else: 
-            pano_leaving = row[0]
-            break
-    multi_view = [pano_approaching, pano_id, pano_leaving]
-    return multi_view
+    approaching_candidates = pano_locations.iloc[:central_pano_index][::-1] # for approaching view, search from central to index 0
+    leaving_candidates = pano_locations.iloc[central_pano_index+1:]
+    pano_approaching = None
+    pano_leaving = None
+    
+    def find_valid_pano(candidates):
+        for row in candidates.itertuples(index = False):
+            distance_to_central_pano = haversine([row[1], row[2]], [central_lat, central_lon], Unit.METERS)
+            distance_to_inlet = haversine([row[1], row[2]], [inlet_locations[0], inlet_locations[1]], Unit.METERS)
+            if distance_to_central_pano >= 1 and distance_to_inlet <= 15:
+                return row[0]
+
+    pano_approaching = find_valid_pano(approaching_candidates)
+    pano_leaving = find_valid_pano(leaving_candidates)
+    
+    return[pano_approaching, pano_id, pano_leaving] 
 
 def compute_heading_pitch(camera_height, inlet_location, view_loc):
     """
@@ -124,7 +114,7 @@ def compute_heading_pitch(camera_height, inlet_location, view_loc):
     dy = inlet_lat - pano_lat    
     heading = math.degrees(math.atan2(dx, dy))
     distance = haversine(inlet_loc, pano_loc, Unit.METERS)
-    pitch = np.arctan2(camera_height, distance)
+    pitch = -abs(math.degrees(np.arctan2(camera_height, distance)))
     return heading, pitch
 
 def cropping_properties(pano_heading, camera_height, inlet_id, inlet_location, multi_view, pano_locations):
@@ -157,78 +147,80 @@ def save_images(multi_view, inlet_id, input_path, output_path):
     :param output_path: file path, directory to where the multiview images will be saved
     Three images are saved, named as {inlet_id}_{approaching/center/leaving}.jpg 
     """
-    image_extensions = 'jpg'
+    image_extensions = 'png'
     approaching, center, leaving = multi_view
     for label, pano_id in zip(['approaching', 'center', 'leaving'], [approaching, center, leaving]):
-        if not pano_id:
-            continue
+        pano_id = f"{pano_id:.6f}" # to enforce trailing zeros in panoramas ids
         input = os.path.join(input_path, f"{pano_id}.{image_extensions}")
         output = os.path.join(output_path, f"{inlet_id}_{label}.{image_extensions}")
         os.makedirs(os.path.dirname(output), exist_ok=True)
         try:
-            shutil.move(input, output)
+            shutil.copy(input, output)
         except FileNotFoundError:
+            print(f"File not found: {input}")
             pass       
 
-# The functions below were copied and adapted from https://blogs.codingballad.com/unwrapping-the-view-transforming-360-panoramas-into-intuitive-videos-with-python-6009bd5bca94
-def map_to_sphere(x, y, z, W, H, f, yaw_radian, pitch_radian):
-    """
-    Converts a point from Cartesian coordinate to Spherical coordinate
-    :param x, y, z: floats, Cartesian coordinate
-    :param W, H, f: floats, width, height, and focal length of the rectilinear image
-    :param yaw_radian, pitch_radian: floats, yaw and pitch of the rectilinear image
-    Returns angle theta (angle from positive z-axis to the point) and phi (angle from positive x-axis in the xy-plane)
-    """
-    theta = np.arccos(z / np.sqrt(x ** 2 + y ** 2 + z ** 2))
-    phi = np.arctan2(y, x)
+# The functions below were modified from https://github.com/fuenwang/Equirec2Perspec/blob/master/Equirec2Perspec.py
+def xyz2lonlat(xyz):
+    atan2 = np.arctan2
+    asin = np.arcsin
 
-    theta_prime = np.arccos(np.sin(theta) * np.sin(phi) * np.sin(pitch_radian) + np.cos(theta) * np.cos(pitch_radian))
-    phi_prime = np.arctan2(np.sin(theta) * np.sin(phi) * np.cos(pitch_radian) - np.cos(theta) * np.sin(pitch_radian), np.sin(theta) * np.cos(phi))
-    phi_prime += yaw_radian
-    phi_prime = phi_prime % (2 * np.pi)
-    return theta_prime.flatten(), phi_prime.flatten()
+    norm = np.linalg.norm(xyz, axis=-1, keepdims=True)
+    xyz_norm = xyz / norm
+    x = xyz_norm[..., 0:1]
+    y = xyz_norm[..., 1:2]
+    z = xyz_norm[..., 2:]
 
-def interpolate_color(coords, img, method='bilinear'):
-    """
-    Samples RGB color values from an image coordinate
-    :param coords: floats, a point on the image in Spherical coordinate
-    :param img: np array, RGB color values of a point on the image
-    Returns an np array of RGB color valuess 
-    """
-    order = {'nearest': 0, 'bilinear': 1, 'bicubic': 3}.get(method, 1)
-    red = map_coordinates(img[:, :, 0], coords, order=order, mode='reflect')
-    green = map_coordinates(img[:, :, 1], coords, order=order, mode='reflect')
-    blue = map_coordinates(img[:, :, 2], coords, order=order, mode='reflect')
-    return np.stack((red, green, blue), axis=-1)
+    lon = atan2(x, z)
+    lat = asin(y)
+    lst = [lon, lat]
 
-def panorama_to_plane(panorama_path, FOV, output_size, yaw, pitch):
-    """
-    Transforms the panorama image into a rectilinear image
-    :param panorama_path: file path, directory to the panorama image path
-    :param FOV: int, field of view of the rectilinear image
-    :param output_size: a list of int, width and height of the rectilinear image
-    :param yaw, pitch: int, yaw and pitch angle of the rectilinear image 
-    Returns the rectified image at a given size, yaw, and pitch
-    """
-    panorama = Image.open(panorama_path).convert('RGB')
-    pano_width, pano_height = panorama.size
-    pano_array = np.array(panorama)
-    yaw_radian = np.radians(yaw)
-    pitch_radian = np.radians(pitch)
-    W, H = output_size
-    f = (0.5 * W) / np.tan(np.radians(FOV) / 2)
-    u, v = np.meshgrid(np.arange(W), np.arange(H), indexing='xy')
-    x = u - W / 2
-    y = H / 2 - v
-    z = f
-    theta, phi = map_to_sphere(x, y, z, yaw_radian, pitch_radian)
-    U = phi * pano_width / (2 * np.pi)
-    V = theta * pano_height / np.pi
-    U, V = U.flatten(), V.flatten()
-    coords = np.vstack((V, U))
-    colors = interpolate_color(coords, pano_array)
-    output_image = Image.fromarray(colors.reshape((H, W, 3)).astype('uint8'), 'RGB')
-    return output_image
+    out = np.concatenate(lst, axis=-1)
+    return out
+
+def lonlat2XY(lonlat, shape):
+    X = (lonlat[..., 0:1] / (2 * np.pi) + 0.5) * (shape[1] - 1)
+    Y = (lonlat[..., 1:] / (np.pi) + 0.5) * (shape[0] - 1)
+    lst = [X, Y]
+    out = np.concatenate(lst, axis=-1)
+
+    return out 
+
+def pano_to_rect(FOV, theta, phi, h, w, img):
+    # Determine the focal length
+    f = w*1/(2*np.tan(np.radians(0.5*FOV)))
+
+    # Construct the camera intrinsic matrix and then invert it
+    cx = (w - 1) / 2.0 
+    cy = (h - 1) / 2.0 # optical center of the image
+    K = np.array([
+        [f, 0, cx],
+        [0, f, cy],
+        [0, 0,  1],
+    ], np.float32)
+    K_inv = np.linalg.inv(K)
+
+    # Project 2D pixel coordinate into a 3D direction vector in camera space
+    x = np.arange(w)
+    y = np.arange(h)
+    x, y = np.meshgrid(x, y)
+    z = np.ones_like(x)
+    xyz = np.concatenate([x[..., None], y[..., None], z[..., None]], axis=-1)
+    xyz = xyz @ K_inv.T
+
+    y_axis = np.array([0.0, 1.0, 0.0], np.float32)
+    x_axis = np.array([1.0, 0.0, 0.0], np.float32)
+    R1, _ = cv2.Rodrigues(y_axis * np.radians(theta))
+    R2, _ = cv2.Rodrigues(np.dot(R1, x_axis) * np.radians(phi))
+    R = R2 @ R1
+    xyz = xyz @ R.T
+    lonlat = xyz2lonlat(xyz) 
+    img = cv2.imread(img, cv2.IMREAD_COLOR)
+    [height, wdith, _] = img.shape
+    XY = lonlat2XY(lonlat, shape=img.shape).astype(np.float32)
+    persp = cv2.remap(img, XY[..., 0], XY[..., 1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
+    return persp
+
 
 def data_split(img_dir, label_dir, dataset_dir, validation_ratio, testing_ratio):
     """
@@ -287,6 +279,9 @@ if __name__ == '__main__':
     FOV = 120
     camera_height = 2.1  # height of the camera in meters
     vehicle_heading = 2850  # horizontal pixel coordinate from the center of the panorama
+
+    # Output image parameters:
+    output_size = (640, 640)
     
     # Extracting panorama images closest to the inlet
     inlet_properties = extract_inlet_location(inlet_data)
@@ -298,37 +293,33 @@ if __name__ == '__main__':
     for inlet_id, closest_panorama_id, shortest_distance in matches:
         inlet_index = inlet_properties[inlet_properties['inlet_id'] == inlet_id].index[0]
         inlet_locations = inlet_properties.iloc[inlet_index, 1:3]
-        multi_view = get_multiview(inlet_locations, pano_locations, closest_panorama_id, shortest_distance)
-        print(multi_view)
+        multi_view = get_multiview(inlet_locations, pano_locations, closest_panorama_id)
         heading_pitch.extend(cropping_properties(vehicle_heading, camera_height, inlet_id, inlet_locations, multi_view, pano_locations))
+        print(heading_pitch)
         save_images(multi_view, inlet_id, raw_images, inlet_images)
+
     df = pd.DataFrame(heading_pitch, columns = ['filename', 'heading', 'pitch'])     
     df.to_csv(cropping_properties_data, index = False)
     
-    """
     # Save cropped rectilinear images in pre_datasplit/images folder
     df = pd.read_csv(cropping_properties_data)
     if not os.path.exists(training_images):
         os.makedirs(training_images)
-    
 
     # Extract the panorama ID from image name, and find the corresponding heading and pitch from the cropping properties dataframe    
-    for image_name in tqdm(os.listdir(inlet_images)):
+    for image_name in Path(inlet_images).iterdir():
         image_path = os.path.join(inlet_images, image_name)
-        stem = image_name.split('.')[0]
+        filename_str = image_name.stem
+        stem = filename_str.split('.')[0]
         row = df[df['filename'] == stem]
         if row.empty:
             continue
         heading = row.iloc[0]['heading']
         pitch = row.iloc[0]['pitch']
-        pil_image = panorama_to_plane(image_path, FOV, output_size[0], output_size[1], heading, pitch)
-        
-        # Convert PIL RGB to OpenCV BGR
-        opencv_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-        
-        full_path = os.path.join(training_images, image_name)
-        cv2.imwrite(full_path, opencv_image)
+        rect_img = pano_to_rect(FOV, heading, pitch, output_size[0], output_size[1], image_path)
+        cv2.imwrite(training_images + '/' + image_name.name, rect_img)
 
+    """
     # Split the data into training and validation folders
     split_ratio = 0.8
     data_split(training_images, training_labels, dataset_dir, validation_ratio=0.1, testing_ratio=0.1)  
