@@ -1,19 +1,18 @@
-import random
-import pandas as pd
-from sklearn.neighbors import BallTree
-from haversine import haversine, Unit
 import math
-from itertools import islice
 import shutil
 import os
-import numpy as np
-from PIL import Image
-from scipy.ndimage import map_coordinates
+import random
 import cv2 
+import pandas as pd
+import numpy as np
+import py360convert
+import utm
+from scipy.spatial.transform import Rotation as R
+from sklearn.neighbors import BallTree
+from haversine import haversine, Unit
 from pathlib import Path
 
-
-def extract_inlet_location(file_path):
+def extract_inlet_location(waterloo_data, kitchener_data):
     """
     Extract latitude and longtitude of drain inlets from the city database
     Warning: The function is specifically designed for City of Waterloo's database format
@@ -21,23 +20,65 @@ def extract_inlet_location(file_path):
     :param file_path: str, file path to a csv file containing the city inlet database
     Returns a geodetic coordinates of the drain inlet locations
     """
-    df = pd.read_csv(file_path)
-    inlet_locations = pd.DataFrame(df[["ASSET_ID", "y", "x"]].values, columns=["inlet_id", "lat", "lon"])
-    inlet_locations = inlet_locations.dropna()
+    waterloo = pd.read_csv(waterloo_data)
+    kitchener = pd.read_csv(kitchener_data)
+    inlet_locations_waterloo = pd.DataFrame(waterloo[["ASSET_ID", "y", "x"]].values, columns=["inlet_id", "lat", "lon"])
+    inlet_locations_waterloo = inlet_locations_waterloo.dropna()
+
+    # Note that Kitchener database uses the UTM coordinates - therefore we must convert it to latitude and longtitude prior to processing 
+    inlet_locations_kitchener = pd.DataFrame(kitchener[["OBJECTID", "x", "y"]].values, columns=["inlet_id", "utme", "utmn"])
+    inlet_locations_kitchener = inlet_locations_kitchener.dropna()
+    inlet_locations_kitchener[["lat", "lon"]] = inlet_locations_kitchener.apply(lambda row: utm.to_latlon(row['utme'], row['utmn'], 17, northern=True), axis=1, result_type='expand')
+    inlet_locations_kitchener = inlet_locations_kitchener.drop(columns=['utme', 'utmn'])
+
+    # Combine the databases
+    inlet_locations = pd.concat([inlet_locations_waterloo, inlet_locations_kitchener], axis=0, ignore_index=True)
     return inlet_locations
 
-def panorama_location(file_path):
+import pandas as pd
+import numpy as np
+
+def panorama_location(file_path, lag_offset=1):
     """
-    Convert local poses of the panorama to geodetic coordinates using the enu2geodetic function
     Assumption: The first row of the csv file represents the starting geodetic coordinates
     The csv file is structured as: [local translation N x 3| rotation quaternions N x 4]
     Warning: The input csv file must be delimited by space
+    
     :param file_path: str, file path to a csv file containing the data collection vehicle poses
-    Returns a geodetic coordinates of the panorama locations
+    :param lag_offset: int, number of rows to shift sensor data down to align with image IDs (default is 1)
+    Returns geodetic coordinates of the panorama locations
     """
     df = pd.read_csv(file_path, sep=' ')
+    
+    # 1. Shift all columns EXCEPT the first one (panoramas_id) downwards
+    data_columns = df.columns[1:] 
+    df[data_columns] = df[data_columns].shift(lag_offset)
+    
+    # 2. Drop the initial rows that now contain NaN due to the downward shift
+    df = df.iloc[lag_offset:].reset_index(drop=True)
+
+    # Proceed with the original extraction logic
     pano_locations = df.iloc[:, [0, 5, 4, 6]].copy()
     pano_locations.columns = ['panoramas_id', 'lat', 'lon', 'alt']
+      
+    # Shift coordinates to calculate the vector to the NEXT panorama
+    pano_locations['next_lat'] = pano_locations['lat'].shift(-1)
+    pano_locations['next_lon'] = pano_locations['lon'].shift(-1)
+
+    # Handle the final row by carrying over the previous distance delta
+    pano_locations.loc[pano_locations.index[-1], 'next_lat'] = pano_locations['lat'].iloc[-1] + (pano_locations['lat'].iloc[-1] - pano_locations['lat'].iloc[-2])
+    pano_locations.loc[pano_locations.index[-1], 'next_lon'] = pano_locations['lon'].iloc[-1] + (pano_locations['lon'].iloc[-1] - pano_locations['lon'].iloc[-2])
+
+    # Calculate True North trajectory heading using spherical approximation
+    dx = (pano_locations['next_lon'] - pano_locations['lon']) * np.cos(np.radians((pano_locations['lat'] + pano_locations['next_lat']) / 2))
+    dy = pano_locations['next_lat'] - pano_locations['lat']
+    
+    # Calculate global heading clockwise from North
+    pano_locations['camera_yaw'] = (np.degrees(np.arctan2(dx, dy)) + 360) % 360
+    
+    # Drop the temp columns to keep the dataframe clean
+    pano_locations = pano_locations.drop(columns=['next_lat', 'next_lon'])
+    
     return pano_locations
 
 def closest_panoramas_id(inlet_locations, pano_locations):
@@ -69,7 +110,7 @@ def closest_panoramas_id(inlet_locations, pano_locations):
 def get_multiview(inlet_locations, pano_locations, pano_id):
     """
     Given the id of the closest panorama (centeral pano) to the inlet and its distance to the inlet, identify two nearby pano_ids that meet the following conditions:
-    1. At least 2 meters away from centeral pano
+    1. At least 1 meters away from centeral pano
     2. Must be within 15 meters from the inlet
     3. One approaching and one leaving the centeral pano along the travelling direction
     Assumption: Condtion 1 is set given that panorma captures 10 images every second and it is travelling at approximately 50 km/hr
@@ -86,13 +127,15 @@ def get_multiview(inlet_locations, pano_locations, pano_id):
     pano_approaching = None
     pano_leaving = None
     
+    # Find valid panoramas near central pano
     def find_valid_pano(candidates):
         for row in candidates.itertuples(index = False):
             distance_to_central_pano = haversine([row[1], row[2]], [central_lat, central_lon], Unit.METERS)
-            distance_to_inlet = haversine([row[1], row[2]], [inlet_locations[0], inlet_locations[1]], Unit.METERS)
-            if distance_to_central_pano >= 1 and distance_to_inlet <= 15:
+            distance_to_inlet = haversine([row[1], row[2]], [inlet_locations['lat'], inlet_locations['lon']], Unit.METERS)
+            # Required conditions for valid panos
+            if distance_to_central_pano >= 1 and distance_to_inlet <= 10:
                 return row[0]
-
+            
     pano_approaching = find_valid_pano(approaching_candidates)
     pano_leaving = find_valid_pano(leaving_candidates)
     
@@ -102,47 +145,80 @@ def compute_heading_pitch(camera_height, inlet_location, view_loc):
     """
     Compute compass heading (0 to 360 degrees) from panorama center to drain inlet
     Assumption: The haversine between inlet and panorama effectively becomes a straight line due to a short distance  
-    :param inlet_location: list of floats, latitude and longitude of the inlet
-    :param view_loc: list of floats, latitude and longitude of the panorama
+    :param camera_height: float, height of the camera in meters
+    :param inlet_location: pandas Series/dict with 'lat' and 'lon'
+    :param view_loc: tuple of (lat, lon) for the panorama
     Returns heading and heading from panorama center to drain inlet
     """
-    inlet_lat, inlet_long = inlet_location[0], inlet_location[1]
+    inlet_lat, inlet_long = inlet_location['lat'], inlet_location['lon']
     pano_lat, pano_long = view_loc[0], view_loc[1]
-    inlet_loc = (inlet_lat, inlet_long)
-    pano_loc = (pano_lat, pano_long)
+
+    # Calculate the differences
     dx = (inlet_long - pano_long) * math.cos(math.radians((pano_lat + inlet_lat) / 2))
-    dy = inlet_lat - pano_lat    
-    heading = math.degrees(math.atan2(dx, dy))
-    distance = haversine(inlet_loc, pano_loc, Unit.METERS)
-    pitch = -abs(math.degrees(np.arctan2(camera_height, distance)))
+    dy = inlet_lat - pano_lat   
+
+    # Calculate the global heading clockwise from North
+    heading = (math.degrees(math.atan2(dx, dy)) + 360) % 360 # a positive value between 0 and 360
+
+    # Calculate pitch
+    distance = haversine((inlet_lat, inlet_long), (pano_lat, pano_long), Unit.METERS)
+    pitch = math.degrees(math.atan2(-camera_height, distance)) # negative pitch for downward looking
     return heading, pitch
 
-def cropping_properties(pano_heading, camera_height, inlet_id, inlet_location, multi_view, pano_locations):
+def cropping_properties(inlet_id, inlet_location, multi_view, pano_locations, camera_height, pano_width, vehicle_pixel_x):
     """
-    To calculate the heading and pitch to center the drain inlet at the center of the rectilinear image
-    :param inlet_location: list of floats, latitude and longitude of the inlet
-    :param multi_view: list of floats, three panorama ids for the inlet
+    Calculate the relative heading (theta) and pitch (phi) to center the drain inlet.
+    Note that we account for a case where vehicle travelling direction is not aligned with the panorama direction
+    :param inlet_id: int, the ID of the current inlet
+    :param inlet_location: pandas Series/dict with 'lat' and 'lon'
+    :param multi_view: list of floats, three panorama ids [approaching, center, leaving]
+    :param pano_locations: dataframe, contains 'lat', 'lon', and 'camera_yaw'
+    :param camera_height: float, height of camera in meters
     """
-    cropping_properties = []
+    cropping_data = []
     labels = ['approaching', 'center', 'leaving']
+    
+    # Calculate how many degrees the vehicle's travelling direction is offset from the panorama center [-180, 180]
+    vehicle_offset_deg = ((vehicle_pixel_x / pano_width) - 0.5) * 360
+    
     for view_id, label in zip(multi_view, labels):
-            if not view_id:
-                continue
-            view_row = pano_locations[pano_locations['panoramas_id'] == view_id]
-            if view_row.empty:
-                continue
-            view_loc = (view_row.iloc[0]['lat'], view_row.iloc[0]['lon'])
-            relative_heading, pitch = compute_heading_pitch(camera_height, inlet_location, view_loc)
-            true_heading = (pano_heading + relative_heading) %360
-            # Save the new filename stem so we can match it later
-            cropping_properties.append([f"{inlet_id}_{label}", true_heading, pitch])
-    return cropping_properties
+        if not view_id:
+            continue
+        view_row = pano_locations[pano_locations['panoramas_id'] == view_id]
+        if view_row.empty:
+            continue
+        
+        view_loc = (view_row.iloc[0]['lat'], view_row.iloc[0]['lon'])
+        
+        # Calculate the panorama heading relative to the True North (1)
+        vehicle_global_heading = view_row.iloc[0]['camera_yaw'] 
+
+        # Compass heading of th inlet
+        inlet_global_heading, pitch = compute_heading_pitch(camera_height, inlet_location, view_loc)
+        
+        # Assuming the vehicle offset describes the angle from the camera center to the vehicle
+        camera_center_heading = (vehicle_global_heading - vehicle_offset_deg) % 360
+
+        # Calculate the projection heading depending on the following conditions
+        if camera_center_heading < inlet_global_heading:
+            alpha = (inlet_global_heading - camera_center_heading)
+            pano_to_rect = (alpha + 180) % 360 - 180  
+        elif camera_center_heading > inlet_global_heading:
+            alpha = (camera_center_heading - inlet_global_heading)
+            pano_to_rect = (-alpha + 180) % 360 - 180
+        else:
+            pano_to_rect = 0  
+
+        cropping_data.append([f"{inlet_id}_{label}", pano_to_rect, pitch])
+        
+    return cropping_data
 
 def save_images(multi_view, inlet_id, input_path, output_path):
     """
     Given a set of three panorama ids for the drain inlet, extract and save images in a seperate folder
     Assumption: All panorama images are saved in the folder with panorama ids as their names
     :param multi_view: list of floats, three panorama ids for the inlet
+    :param inlet_id: int, inlet id of interest
     :param input_path: file path, directory to raw panorama images
     :param output_path: file path, directory to where the multiview images will be saved
     Three images are saved, named as {inlet_id}_{approaching/center/leaving}.jpg 
@@ -150,6 +226,8 @@ def save_images(multi_view, inlet_id, input_path, output_path):
     image_extensions = 'png'
     approaching, center, leaving = multi_view
     for label, pano_id in zip(['approaching', 'center', 'leaving'], [approaching, center, leaving]):
+        if pano_id is None:
+            continue
         pano_id = f"{pano_id:.6f}" # to enforce trailing zeros in panoramas ids
         input = os.path.join(input_path, f"{pano_id}.{image_extensions}")
         output = os.path.join(output_path, f"{inlet_id}_{label}.{image_extensions}")
@@ -160,69 +238,27 @@ def save_images(multi_view, inlet_id, input_path, output_path):
             print(f"File not found: {input}")
             pass       
 
-# The functions below were modified from https://github.com/fuenwang/Equirec2Perspec/blob/master/Equirec2Perspec.py
-def xyz2lonlat(xyz):
-    atan2 = np.arctan2
-    asin = np.arcsin
+def pano_to_rect(FOV, theta, phi, h, w, img_path):
+    """
+    Given a set of three panorama ids for the drain inlet, extract and save images in a seperate folder
+    Assumption: All panorama images are saved in the folder with panorama ids as their names
+    :param multi_view: list of floats, three panorama ids for the inlet
+    :param inlet_id: int, inlet id of interest
+    :param input_path: file path, directory to raw panorama images
+    :param output_path: file path, directory to where the multiview images will be saved
+    Three images are saved, named as {inlet_id}_{approaching/center/leaving}.jpg 
+    """
+    # Read the image from the given file path
+    img = cv2.imread(img_path, cv2.IMREAD_COLOR)
 
-    norm = np.linalg.norm(xyz, axis=-1, keepdims=True)
-    xyz_norm = xyz / norm
-    x = xyz_norm[..., 0:1]
-    y = xyz_norm[..., 1:2]
-    z = xyz_norm[..., 2:]
+    # Check if the image loaded correctly to prevent silent failures
+    if img is None:
+        raise ValueError(f"Could not load image at {img_path}")
+    persp = py360convert.e2p(img, fov_deg=FOV, u_deg=theta, v_deg=phi, out_hw=(int(h), int(w)), mode='bilinear')
 
-    lon = atan2(x, z)
-    lat = asin(y)
-    lst = [lon, lat]
-
-    out = np.concatenate(lst, axis=-1)
-    return out
-
-def lonlat2XY(lonlat, shape):
-    X = (lonlat[..., 0:1] / (2 * np.pi) + 0.5) * (shape[1] - 1)
-    Y = (lonlat[..., 1:] / (np.pi) + 0.5) * (shape[0] - 1)
-    lst = [X, Y]
-    out = np.concatenate(lst, axis=-1)
-
-    return out 
-
-def pano_to_rect(FOV, theta, phi, h, w, img):
-    # Determine the focal length
-    f = w*1/(2*np.tan(np.radians(0.5*FOV)))
-
-    # Construct the camera intrinsic matrix and then invert it
-    cx = (w - 1) / 2.0 
-    cy = (h - 1) / 2.0 # optical center of the image
-    K = np.array([
-        [f, 0, cx],
-        [0, f, cy],
-        [0, 0,  1],
-    ], np.float32)
-    K_inv = np.linalg.inv(K)
-
-    # Project 2D pixel coordinate into a 3D direction vector in camera space
-    x = np.arange(w)
-    y = np.arange(h)
-    x, y = np.meshgrid(x, y)
-    z = np.ones_like(x)
-    xyz = np.concatenate([x[..., None], y[..., None], z[..., None]], axis=-1)
-    xyz = xyz @ K_inv.T
-
-    y_axis = np.array([0.0, 1.0, 0.0], np.float32)
-    x_axis = np.array([1.0, 0.0, 0.0], np.float32)
-    R1, _ = cv2.Rodrigues(y_axis * np.radians(theta))
-    R2, _ = cv2.Rodrigues(np.dot(R1, x_axis) * np.radians(phi))
-    R = R2 @ R1
-    xyz = xyz @ R.T
-    lonlat = xyz2lonlat(xyz) 
-    img = cv2.imread(img, cv2.IMREAD_COLOR)
-    [height, wdith, _] = img.shape
-    XY = lonlat2XY(lonlat, shape=img.shape).astype(np.float32)
-    persp = cv2.remap(img, XY[..., 0], XY[..., 1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
     return persp
 
-
-def data_split(img_dir, label_dir, dataset_dir, validation_ratio, testing_ratio):
+def data_split(img_dir, label_dir, dataset_dir, validation_ratio):
     """
     Split the dataset into train and validation folders
     :param img_dir, directory to the custom image dataset
@@ -239,10 +275,8 @@ def data_split(img_dir, label_dir, dataset_dir, validation_ratio, testing_ratio)
     index_list = list(range(0, total))
     random.shuffle(index_list)
     val_split_point = int(validation_ratio * total)
-    test_split_point = int(testing_ratio * total) + val_split_point
     val_index = index_list[:val_split_point]
-    test_index = index_list[val_split_point:test_split_point]
-    train_index = index_list[test_split_point:]
+    train_index = index_list[val_split_point:]
     # Using the index in the previous steps, split the images and labels accordingly to the coresponding folder
     train_img = os.path.join(dataset_dir, "train/images")
     train_lab = os.path.join(dataset_dir, "train/labels")
@@ -266,11 +300,13 @@ def data_split(img_dir, label_dir, dataset_dir, validation_ratio, testing_ratio)
 
 if __name__ == '__main__':
     # File paths:
-    inlet_data = os.path.join(os.path.dirname(__file__), '..', 'raw_data', 'waterloo.csv')
-    pano_data = os.path.join(os.path.dirname(__file__), '..', 'raw_data', 'laurelwood1', 'camera_poses_transformed.txt')
-    raw_images = os.path.join(os.path.dirname(__file__), '..', 'raw_data', 'laurelwood1', 'images')
+    waterloo_data = os.path.join(os.path.dirname(__file__), '..', 'raw_data', 'waterloo.csv')
+    kitchener_data = os.path.join(os.path.dirname(__file__), '..', 'raw_data', 'kitchener.csv')
+    pano_data = os.path.join(os.path.dirname(__file__), '..', 'raw_data', 'kitchener-end3-strt4', 'camera_poses_transformed.txt')
+    raw_images = os.path.join(os.path.dirname(__file__), '..', 'raw_data', 'kitchener-end3-strt4', 'images')
     inlet_images = os.path.join(os.path.dirname(__file__), '..', 'filtered_data', 'filtered')
     cropping_properties_data = os.path.join(os.path.dirname(__file__), '..', 'filtered_data', 'cropping_properties.csv')
+    rectified_img = os.path.join(os.path.dirname(__file__), '..', 'filtered_data', 'rectified')
     training_images = os.path.join(os.path.dirname(__file__), '..', 'pre_datasplit', 'images') 
     training_labels = os.path.join(os.path.dirname(__file__), '..', 'pre_datasplit', 'labels')
     dataset_dir = os.path.join(os.path.dirname(__file__), '..', 'dataset', 'train')
@@ -278,24 +314,25 @@ if __name__ == '__main__':
     # Panorama parameters:
     FOV = 120
     camera_height = 2.1  # height of the camera in meters
-    vehicle_heading = 2850  # horizontal pixel coordinate from the center of the panorama
-
-    # Output image parameters:
     output_size = (640, 640)
-    
+    pano_width = 4096 # in pixels
+    vehicle_pixel_x = 2835 # vehicle's travelling direction offset from the left of pano
+
     # Extracting panorama images closest to the inlet
-    inlet_properties = extract_inlet_location(inlet_data)
+    inlet_properties = extract_inlet_location(waterloo_data, kitchener_data)
     pano_locations = panorama_location(pano_data)
+
+    # Match inlets to closest panoramas
     matches = closest_panoramas_id(inlet_properties, pano_locations)
 
     # Calculate rectilinear cropping properties and save multiview images
     heading_pitch = []
     for inlet_id, closest_panorama_id, shortest_distance in matches:
-        inlet_index = inlet_properties[inlet_properties['inlet_id'] == inlet_id].index[0]
-        inlet_locations = inlet_properties.iloc[inlet_index, 1:3]
+        inlet_row = inlet_properties.loc[inlet_properties['inlet_id'] == inlet_id].iloc[0]
+        inlet_locations = inlet_row[['lat', 'lon']]
         multi_view = get_multiview(inlet_locations, pano_locations, closest_panorama_id)
-        heading_pitch.extend(cropping_properties(vehicle_heading, camera_height, inlet_id, inlet_locations, multi_view, pano_locations))
-        print(heading_pitch)
+        props = cropping_properties(inlet_id, inlet_locations, multi_view, pano_locations, camera_height, pano_width, vehicle_pixel_x)
+        heading_pitch.extend(props)
         save_images(multi_view, inlet_id, raw_images, inlet_images)
 
     df = pd.DataFrame(heading_pitch, columns = ['filename', 'heading', 'pitch'])     
@@ -311,16 +348,17 @@ if __name__ == '__main__':
         image_path = os.path.join(inlet_images, image_name)
         filename_str = image_name.stem
         stem = filename_str.split('.')[0]
+
         row = df[df['filename'] == stem]
         if row.empty:
             continue
+
         heading = row.iloc[0]['heading']
         pitch = row.iloc[0]['pitch']
-        rect_img = pano_to_rect(FOV, heading, pitch, output_size[0], output_size[1], image_path)
-        cv2.imwrite(training_images + '/' + image_name.name, rect_img)
 
-    """
+        rect_img = pano_to_rect(FOV, heading, pitch, output_size[0], output_size[1], image_path)
+        cv2.imwrite(os.path.join(rectified_img + '/' + image_name.name), rect_img)
+
     # Split the data into training and validation folders
     split_ratio = 0.8
-    data_split(training_images, training_labels, dataset_dir, validation_ratio=0.1, testing_ratio=0.1)  
-    """
+    data_split(training_images, training_labels, dataset_dir, validation_ratio=0.2)  
