@@ -111,7 +111,7 @@ def get_multiview(inlet_locations, pano_locations, pano_id):
     """
     Given the id of the closest panorama (centeral pano) to the inlet and its distance to the inlet, identify two nearby pano_ids that meet the following conditions:
     1. At least 1 meters away from centeral pano
-    2. Must be within 15 meters from the inlet
+    2. Must be within 10 meters from the inlet
     3. One approaching and one leaving the centeral pano along the travelling direction
     Assumption: Condtion 1 is set given that panorma captures 10 images every second and it is travelling at approximately 50 km/hr
     :param inlet_locations: list of floats, latitude and longitude of the inlet 
@@ -122,12 +122,19 @@ def get_multiview(inlet_locations, pano_locations, pano_id):
     """
     central_pano_index = pano_locations[pano_locations['panoramas_id'] == pano_id].index[0]
     central_lat, central_lon = pano_locations.iloc[central_pano_index, 1:3]
-    approaching_candidates = pano_locations.iloc[:central_pano_index][::-1] # for approaching view, search from central to index 0
-    leaving_candidates = pano_locations.iloc[central_pano_index+1:]
+
+    # Restrict the search to a maximum of 10 panoramas before and after the central pano
+    # The restriction is necessary to prevent the algorithm from grouping panoramas from a later revisit
+    start_idx_approaching = max(0, central_pano_index - 10)
+    end_idx_leaving = min(len(pano_locations), central_pano_index + 11)
+
+    approaching_candidates = pano_locations.iloc[start_idx_approaching:central_pano_index][::-1] 
+    leaving_candidates = pano_locations.iloc[central_pano_index+1:end_idx_leaving]
+
     pano_approaching = None
     pano_leaving = None
     
-    # Find valid panoramas near central pano
+    # Find valid panoramas near central pano within the restricted window
     def find_valid_pano(candidates):
         for row in candidates.itertuples(index = False):
             distance_to_central_pano = haversine([row[1], row[2]], [central_lat, central_lon], Unit.METERS)
@@ -138,7 +145,7 @@ def get_multiview(inlet_locations, pano_locations, pano_id):
             
     pano_approaching = find_valid_pano(approaching_candidates)
     pano_leaving = find_valid_pano(leaving_candidates)
-    
+
     return[pano_approaching, pano_id, pano_leaving] 
 
 def compute_heading_pitch(camera_height, inlet_location, view_loc):
@@ -184,22 +191,19 @@ def cropping_properties(inlet_id, inlet_location, multi_view, pano_locations, ca
     for view_id, label in zip(multi_view, labels):
         if not view_id:
             continue
+            
+        # Ensure pano_id format matches the image names exactly
+        view_id_str = f"{view_id:.6f}"
+        
         view_row = pano_locations[pano_locations['panoramas_id'] == view_id]
         if view_row.empty:
             continue
         
         view_loc = (view_row.iloc[0]['lat'], view_row.iloc[0]['lon'])
-        
-        # Calculate the panorama heading relative to the True North (1)
         vehicle_global_heading = view_row.iloc[0]['camera_yaw'] 
-
-        # Compass heading of th inlet
         inlet_global_heading, pitch = compute_heading_pitch(camera_height, inlet_location, view_loc)
-        
-        # Assuming the vehicle offset describes the angle from the camera center to the vehicle
         camera_center_heading = (vehicle_global_heading - vehicle_offset_deg) % 360
 
-        # Calculate the projection heading depending on the following conditions
         if camera_center_heading < inlet_global_heading:
             alpha = (inlet_global_heading - camera_center_heading)
             pano_to_rect = (alpha + 180) % 360 - 180  
@@ -209,6 +213,7 @@ def cropping_properties(inlet_id, inlet_location, multi_view, pano_locations, ca
         else:
             pano_to_rect = 0  
 
+        # Include pano_id in the filename to prevent overwriting from intersecting trajectories
         cropping_data.append([f"{inlet_id}_{label}", pano_to_rect, pitch])
         
     return cropping_data
@@ -228,15 +233,19 @@ def save_images(multi_view, inlet_id, input_path, output_path):
     for label, pano_id in zip(['approaching', 'center', 'leaving'], [approaching, center, leaving]):
         if pano_id is None:
             continue
-        pano_id = f"{pano_id:.6f}" # to enforce trailing zeros in panoramas ids
-        input = os.path.join(input_path, f"{pano_id}.{image_extensions}")
+            
+        pano_id_str = f"{pano_id:.6f}"
+        input = os.path.join(input_path, f"{pano_id_str}.{image_extensions}")
+        
+        # Output name now includes pano_id_str to match the CSV
         output = os.path.join(output_path, f"{inlet_id}_{label}.{image_extensions}")
+        
         os.makedirs(os.path.dirname(output), exist_ok=True)
         try:
             shutil.copy(input, output)
         except FileNotFoundError:
             print(f"File not found: {input}")
-            pass       
+            pass    
 
 def pano_to_rect(FOV, theta, phi, h, w, img_path):
     """
@@ -302,11 +311,9 @@ if __name__ == '__main__':
     # File paths:
     waterloo_data = os.path.join(os.path.dirname(__file__), '..', 'raw_data', 'waterloo.csv')
     kitchener_data = os.path.join(os.path.dirname(__file__), '..', 'raw_data', 'kitchener.csv')
-    pano_data = os.path.join(os.path.dirname(__file__), '..', 'raw_data', 'kitchener-end3-strt4', 'camera_poses_transformed.txt')
-    raw_images = os.path.join(os.path.dirname(__file__), '..', 'raw_data', 'kitchener-end3-strt4', 'images')
+    raw_data = os.path.join(os.path.dirname(__file__), '..', 'raw_data')
     inlet_images = os.path.join(os.path.dirname(__file__), '..', 'filtered_data', 'filtered')
     cropping_properties_data = os.path.join(os.path.dirname(__file__), '..', 'filtered_data', 'cropping_properties.csv')
-    rectified_img = os.path.join(os.path.dirname(__file__), '..', 'filtered_data', 'rectified')
     training_images = os.path.join(os.path.dirname(__file__), '..', 'pre_datasplit', 'images') 
     training_labels = os.path.join(os.path.dirname(__file__), '..', 'pre_datasplit', 'labels')
     dataset_dir = os.path.join(os.path.dirname(__file__), '..', 'dataset', 'train')
@@ -318,24 +325,43 @@ if __name__ == '__main__':
     pano_width = 4096 # in pixels
     vehicle_pixel_x = 2835 # vehicle's travelling direction offset from the left of pano
 
-    # Extracting panorama images closest to the inlet
     inlet_properties = extract_inlet_location(waterloo_data, kitchener_data)
-    pano_locations = panorama_location(pano_data)
+    
+    # List to aggregate all heading and pitch data across folders
+    all_heading_pitch = []
 
-    # Match inlets to closest panoramas
-    matches = closest_panoramas_id(inlet_properties, pano_locations)
+    # Iterate through all subdirectories in raw_data
+    for folder_name in os.listdir(raw_data):
+        folder_path = os.path.join(raw_data, folder_name)
+        
+        # Skip files (like waterloo.csv and kitchener.csv)
+        if not os.path.isdir(folder_path):
+            continue
 
-    # Calculate rectilinear cropping properties and save multiview images
-    heading_pitch = []
-    for inlet_id, closest_panorama_id, shortest_distance in matches:
-        inlet_row = inlet_properties.loc[inlet_properties['inlet_id'] == inlet_id].iloc[0]
-        inlet_locations = inlet_row[['lat', 'lon']]
-        multi_view = get_multiview(inlet_locations, pano_locations, closest_panorama_id)
-        props = cropping_properties(inlet_id, inlet_locations, multi_view, pano_locations, camera_height, pano_width, vehicle_pixel_x)
-        heading_pitch.extend(props)
-        save_images(multi_view, inlet_id, raw_images, inlet_images)
+        pano_data = os.path.join(folder_path, 'camera_poses_transformed.txt')
+        raw_images = os.path.join(folder_path, 'images')
 
-    df = pd.DataFrame(heading_pitch, columns = ['filename', 'heading', 'pitch'])     
+        # Skip if the required files/folders do not exist in the current subdirectory
+        if not os.path.exists(pano_data) or not os.path.exists(raw_images):
+            continue
+            
+        print(f"Processing panoramas in: {folder_name}")
+        
+        pano_locations = panorama_location(pano_data)
+
+        # Match inlets to closest panoramas for this specific folder
+        matches = closest_panoramas_id(inlet_properties, pano_locations)
+
+        # Calculate rectilinear cropping properties and save multiview images
+        for inlet_id, closest_panorama_id, shortest_distance in matches:
+            inlet_row = inlet_properties.loc[inlet_properties['inlet_id'] == inlet_id].iloc[0]
+            inlet_locations = inlet_row[['lat', 'lon']]
+            multi_view = get_multiview(inlet_locations, pano_locations, closest_panorama_id)
+            props = cropping_properties(inlet_id, inlet_locations, multi_view, pano_locations, camera_height, pano_width, vehicle_pixel_x)
+            all_heading_pitch.extend(props) # save all cropping properties in one dataframe
+            save_images(multi_view, inlet_id, raw_images, inlet_images)
+
+    df = pd.DataFrame(all_heading_pitch, columns = ['filename', 'heading', 'pitch'])     
     df.to_csv(cropping_properties_data, index = False)
     
     # Save cropped rectilinear images in pre_datasplit/images folder
@@ -347,9 +373,8 @@ if __name__ == '__main__':
     for image_name in Path(inlet_images).iterdir():
         image_path = os.path.join(inlet_images, image_name)
         filename_str = image_name.stem
-        stem = filename_str.split('.')[0]
 
-        row = df[df['filename'] == stem]
+        row = df[df['filename'] == filename_str]
         if row.empty:
             continue
 
@@ -357,8 +382,9 @@ if __name__ == '__main__':
         pitch = row.iloc[0]['pitch']
 
         rect_img = pano_to_rect(FOV, heading, pitch, output_size[0], output_size[1], image_path)
-        cv2.imwrite(os.path.join(rectified_img + '/' + image_name.name), rect_img)
+        cv2.imwrite(os.path.join(training_images + '/' + image_name.name), rect_img)
 
+    """
     # Split the data into training and validation folders
-    split_ratio = 0.8
     data_split(training_images, training_labels, dataset_dir, validation_ratio=0.2)  
+    """
