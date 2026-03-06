@@ -39,7 +39,7 @@ class MultiViewInletClassifier:
             for img in os.listdir(folder_path):
                 img_path = os.path.join(folder_path, img)
                 
-                if not img.lower().endswith(('.png', '.jpg', '.jpeg')):
+                if not img.lower().endswith(('.png')):
                     continue
                     
                 img_name = Path(img_path).stem
@@ -51,12 +51,12 @@ class MultiViewInletClassifier:
                 results = self.model.predict(source=img_path, verbose=False)
                 boxes = results[0].boxes
 
-                valid_boxes = [b for b in boxes if b.conf[0].item() >= 0.5]
-                
+                # Discard images that have no or low-confidence bounding box
+                valid_boxes = [b for b in boxes if b.conf[0].item() >= 0.3]
                 if not valid_boxes:
                     continue
 
-                # Function to check if two bounding boxes intersect
+                # Function to check if two bounding boxes intersect (e.g., double inlets)
                 def is_overlap(b1, b2):
                     return not (b1[2] < b2[0] or b1[0] > b2[2] or b1[3] < b2[1] or b1[1] > b2[3])
 
@@ -94,6 +94,7 @@ class MultiViewInletClassifier:
                     if dist < min_dist:
                         min_dist = dist
                         best_group = {
+                            'coords': g['coords'], 'confs,': g['confs'],
                             'x_center': cx, 'y_center': cy,
                             'bb_w': max_x - min_x, 'bb_h': max_y - min_y,
                             'confidence': max(g['confs'])
@@ -101,6 +102,10 @@ class MultiViewInletClassifier:
 
                 records.append({
                     'filename': img_name, 
+                    'x1': best_group['coords'][0][0],
+                    'y1': best_group['coords'][0][1],
+                    'x2': best_group['coords'][0][2],
+                    'y2': best_group['coords'][0][3],
                     'x_center': best_group['x_center'],
                     'y_center': best_group['y_center'],
                     'bb_w': best_group['bb_w'],
@@ -228,16 +233,17 @@ def recompute_rectilinear(df_bboxes, cropping_properties_path, pano_dir, output_
 if __name__ == "__main__":
 
     # File paths
-    base_dir = os.path.dirname(__file__)
-    model_path = os.path.join(base_dir, '..', 'trained_models', 'best.pt')
-    data_path = os.path.join(base_dir, '..', 'validation_data', 'images') # path to initial rectilinear images
-    filtered_pano_path = os.path.join(base_dir, '..', 'filtered_data', 'filtered') # path to the filtered panoramas
-    cropping_properties_path = os.path.join(base_dir, '..', 'filtered_data', 'cropping_properties.csv') # path to the original cropping properties
-    output_path = os.path.join(base_dir, '..', 'corrected_images') # path to save the newly generated images
+    base_dir = "/run/user/1000/gvfs/smb-share:server=ecresearch.uwaterloo.ca,share=cviss/Jack/baf/360streetview"
+    model_path = os.path.join(base_dir, 'trained_models', 'yolov8.pt')
+    data_path = os.path.join(base_dir, 'corrected_images', 'original') # path to initial rectilinear images
+    filtered_pano_path = os.path.join(base_dir, 'filtered_data', 'filtered') # path to the filtered panoramas
+    cropping_properties_path = os.path.join(base_dir, 'filtered_data', 'cropping_properties.csv') # path to the original cropping properties
+    output_path = os.path.join(base_dir, 'corrected_images', 'corrected') # path to save the newly generated images
+    df_path = os.path.join(base_dir, 'corrected_images') 
 
     # Adjustable configuration parameters
     ORIGINAL_FOV = 120        # The FOV used when the initial rectilinear images were created
-    BUFFER_PCT = 1         # Percentage of buffer added around the bounding box (e.g., 0.20 for 20%)
+    BUFFER_PCT = 0.5         # Percentage of buffer added around the bounding box (e.g., 0.20 for 20%)
     OUTPUT_SIZE = (640, 640)  # Desired dimensions for the final corrected images
 
     # Initialize the architecture with your trained weights
@@ -245,6 +251,7 @@ if __name__ == "__main__":
 
     # Generate a dataframe that contains the center coordinates of the bounding boxes
     bb_coord = classifier.bounding_box(data_path)
+    bb_coord.to_csv(os.path.join(df_path, 'bounding_boxes.csv'), index=False)
 
     # Recompute projection angles and extract the corrected rectilinear images
     recompute_rectilinear(

@@ -267,56 +267,16 @@ def pano_to_rect(FOV, theta, phi, h, w, img_path):
 
     return persp
 
-def data_split(img_dir, label_dir, dataset_dir, validation_ratio):
-    """
-    Split the dataset into train and validation folders
-    :param img_dir, directory to the custom image dataset
-    :param label_dir, directory to the image labels
-    :param dataset_dir, directory to where the split dataset will be stored
-    :param validation_ratio, ratio of validation dataset 
-    :param testing_ratio, ratio of testing dataset
-    """
-    img_filenames = sorted([f for f in os.listdir(img_dir)])
-    label_filenames = sorted([f for f in os.listdir(label_dir)])
-    # Count the number of files in the folder
-    total = len(img_filenames)
-    # Create an array with a range of numbers starting at 1 to size of the folder
-    index_list = list(range(0, total))
-    random.shuffle(index_list)
-    val_split_point = int(validation_ratio * total)
-    val_index = index_list[:val_split_point]
-    train_index = index_list[val_split_point:]
-    # Using the index in the previous steps, split the images and labels accordingly to the coresponding folder
-    train_img = os.path.join(dataset_dir, "train/images")
-    train_lab = os.path.join(dataset_dir, "train/labels")
-    val_img = os.path.join(dataset_dir, "val/images")
-    val_lab = os.path.join(dataset_dir, "val/labels")
-    test_img = os.path.join(dataset_dir, "testing/images")
-    test_lab = os.path.join(dataset_dir, "testing/labels")
-    os.makedirs(train_img, exist_ok=True)
-    os.makedirs(train_lab, exist_ok=True)
-    os.makedirs(val_img, exist_ok=True)
-    os.makedirs(val_lab, exist_ok=True)
-    os.makedirs(test_img, exist_ok=True)
-    os.makedirs(test_lab, exist_ok=True)
-    for idx in train_index:
-        shutil.copy(os.path.join(img_dir, img_filenames[idx]), train_img)
-        shutil.copy(os.path.join(label_dir, label_filenames[idx]), train_lab)
-    # Copy validation samples
-    for idx in val_index:
-        shutil.copy(os.path.join(img_dir, img_filenames[idx]), val_img)
-        shutil.copy(os.path.join(label_dir, label_filenames[idx]), val_lab)
-
 if __name__ == '__main__':
     # File paths:
-    waterloo_data = os.path.join(os.path.dirname(__file__), '..', 'raw_data', 'waterloo.csv')
-    kitchener_data = os.path.join(os.path.dirname(__file__), '..', 'raw_data', 'kitchener.csv')
-    raw_data = os.path.join(os.path.dirname(__file__), '..', 'raw_data')
-    inlet_images = os.path.join(os.path.dirname(__file__), '..', 'filtered_data', 'filtered')
-    cropping_properties_data = os.path.join(os.path.dirname(__file__), '..', 'filtered_data', 'cropping_properties.csv')
-    training_images = os.path.join(os.path.dirname(__file__), '..', 'pre_datasplit', 'images') 
-    training_labels = os.path.join(os.path.dirname(__file__), '..', 'pre_datasplit', 'labels')
-    dataset_dir = os.path.join(os.path.dirname(__file__), '..', 'dataset', 'train')
+    base_dir = "/run/user/1000/gvfs/smb-share:server=ecresearch.uwaterloo.ca,share=cviss/Jack/baf/360streetview"
+
+    waterloo_data = os.path.join(base_dir, 'raw_data', 'waterloo.csv')
+    kitchener_data = os.path.join(base_dir, 'raw_data', 'kitchener.csv')
+    raw_data = os.path.join(base_dir, 'raw_data')
+    inlet_images = os.path.join(base_dir, 'filtered_data', 'filtered')
+    cropping_properties_data = os.path.join(base_dir, 'filtered_data', 'cropping_properties.csv')
+    training_images = os.path.join(base_dir, 'corrected_images', 'original') 
 
     # Panorama parameters:
     FOV = 120
@@ -373,6 +333,7 @@ if __name__ == '__main__':
     for image_name in Path(inlet_images).iterdir():
         image_path = os.path.join(inlet_images, image_name)
         filename_str = image_name.stem
+        inlet_id = filename_str.split('_')[0] # inlet id without the view title
 
         row = df[df['filename'] == filename_str]
         if row.empty:
@@ -382,9 +343,8 @@ if __name__ == '__main__':
         pitch = row.iloc[0]['pitch']
 
         rect_img = pano_to_rect(FOV, heading, pitch, output_size[0], output_size[1], image_path)
-        cv2.imwrite(os.path.join(training_images + '/' + image_name.name), rect_img)
+        save_path = os.path.join(training_images + '/' + inlet_id)
+        os.makedirs(save_path, exist_ok=True)
 
-    """
-    # Split the data into training and validation folders
-    data_split(training_images, training_labels, dataset_dir, validation_ratio=0.2)  
-    """
+        cv2.imwrite(os.path.join(save_path, image_name.name), rect_img)
+

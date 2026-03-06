@@ -6,3 +6,12 @@ testing/
 code/test.py
 archive/
 filtered_data/
+trained_models/
+object_detection_training/
+debugging/
+corrected_images/
+code/archive/
+segmentation_training/
+
+*.yaml
+
