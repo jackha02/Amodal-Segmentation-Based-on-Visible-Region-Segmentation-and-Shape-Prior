@@ -12,7 +12,7 @@ from sklearn.neighbors import BallTree
 from haversine import haversine, Unit
 from pathlib import Path
 
-def extract_inlet_location(waterloo_data, kitchener_data):
+def extract_inlet_location(waterloo_data, kitchener_data, test_area):
     """
     Extract latitude and longtitude of drain inlets from the city database
     Warning: The function is specifically designed for City of Waterloo's database format
@@ -33,10 +33,14 @@ def extract_inlet_location(waterloo_data, kitchener_data):
 
     # Combine the databases
     inlet_locations = pd.concat([inlet_locations_waterloo, inlet_locations_kitchener], axis=0, ignore_index=True)
-    return inlet_locations
 
-import pandas as pd
-import numpy as np
+    # Filter out the inlets in the test area
+    test_area_df = pd.read_csv(test_area)
+    test_inlet_ids = test_area_df['OBJECTID'].astype(str).tolist()
+    indices_to_drop = inlet_locations[inlet_locations['inlet_id'].isin(test_inlet_ids)].index
+    inlet_locations = inlet_locations.drop(indices_to_drop)
+
+    return inlet_locations
 
 def panorama_location(file_path, lag_offset=1):
     """
@@ -242,7 +246,7 @@ def save_images(multi_view, inlet_id, input_path, output_path):
         
         os.makedirs(os.path.dirname(output), exist_ok=True)
         try:
-            shutil.copy(input, output)
+            shutil.copyfile(input, output)
         except FileNotFoundError:
             print(f"File not found: {input}")
             pass    
@@ -273,6 +277,7 @@ if __name__ == '__main__':
 
     waterloo_data = os.path.join(base_dir, 'raw_data', 'waterloo.csv')
     kitchener_data = os.path.join(base_dir, 'raw_data', 'kitchener.csv')
+    test_area = os.path.join(base_dir, 'raw_data', 'test_area.csv')
     raw_data = os.path.join(base_dir, 'raw_data')
     inlet_images = os.path.join(base_dir, 'filtered_data', 'filtered')
     cropping_properties_data = os.path.join(base_dir, 'filtered_data', 'cropping_properties.csv')
@@ -285,10 +290,10 @@ if __name__ == '__main__':
     pano_width = 4096 # in pixels
     vehicle_pixel_x = 2835 # vehicle's travelling direction offset from the left of pano
 
-    inlet_properties = extract_inlet_location(waterloo_data, kitchener_data)
+    inlet_properties = extract_inlet_location(waterloo_data, kitchener_data, test_area)
     
     # List to aggregate all heading and pitch data across folders
-    all_heading_pitch = []
+    best_matches = {}
 
     # Iterate through all subdirectories in raw_data
     for folder_name in os.listdir(raw_data):
@@ -304,8 +309,6 @@ if __name__ == '__main__':
         # Skip if the required files/folders do not exist in the current subdirectory
         if not os.path.exists(pano_data) or not os.path.exists(raw_images):
             continue
-            
-        print(f"Processing panoramas in: {folder_name}")
         
         pano_locations = panorama_location(pano_data)
 
@@ -314,20 +317,29 @@ if __name__ == '__main__':
 
         # Calculate rectilinear cropping properties and save multiview images
         for inlet_id, closest_panorama_id, shortest_distance in matches:
-            inlet_row = inlet_properties.loc[inlet_properties['inlet_id'] == inlet_id].iloc[0]
-            inlet_locations = inlet_row[['lat', 'lon']]
-            multi_view = get_multiview(inlet_locations, pano_locations, closest_panorama_id)
-            props = cropping_properties(inlet_id, inlet_locations, multi_view, pano_locations, camera_height, pano_width, vehicle_pixel_x)
-            all_heading_pitch.extend(props) # save all cropping properties in one dataframe
-            save_images(multi_view, inlet_id, raw_images, inlet_images)
+            # Ensure only three pa
+            if inlet_id not in best_matches or shortest_distance < best_matches[inlet_id]['distance']:
+                inlet_row = inlet_properties.loc[inlet_properties['inlet_id'] == inlet_id].iloc[0]
+                inlet_locations = inlet_row[['lat', 'lon']]
+                
+                multi_view = get_multiview(inlet_locations, pano_locations, closest_panorama_id)
+                props = cropping_properties(inlet_id, inlet_locations, multi_view, pano_locations, camera_height, pano_width, vehicle_pixel_x)
+                # Store the winning data
+                best_matches[inlet_id] = {
+                    'distance': shortest_distance,
+                    'props': props,
+                    'multi_view': multi_view,
+                    'raw_images_path': raw_images
+                }
+
+    all_heading_pitch = []
+    
+    for inlet_id, match_data in best_matches.items():
+        all_heading_pitch.extend(match_data['props']) 
+        save_images(match_data['multi_view'], inlet_id, match_data['raw_images_path'], inlet_images)
 
     df = pd.DataFrame(all_heading_pitch, columns = ['filename', 'heading', 'pitch'])     
     df.to_csv(cropping_properties_data, index = False)
-    
-    # Save cropped rectilinear images in pre_datasplit/images folder
-    df = pd.read_csv(cropping_properties_data)
-    if not os.path.exists(training_images):
-        os.makedirs(training_images)
 
     # Extract the panorama ID from image name, and find the corresponding heading and pitch from the cropping properties dataframe    
     for image_name in Path(inlet_images).iterdir():
