@@ -1,2 +1,3 @@
-from trainining_images import extract_inlet_location, panorama_location, closest_panoramas_id, get_multiview
-from detection_model_training import data_split
+from training_images import extract_inlet_location, panorama_location, closest_panoramas_id, get_multiview
+from code.detection_model_training import data_split
+from code.segmentation_visualization import process_image_data
