@@ -12,6 +12,12 @@ debugging/
 corrected_images/
 code/archive/
 segmentation_training/
+code/upsampling.py
+runs/
 
 *.yaml
+*.csv
+*.pt
+*.env
+
 

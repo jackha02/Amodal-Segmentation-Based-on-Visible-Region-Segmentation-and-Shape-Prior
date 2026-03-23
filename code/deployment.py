@@ -3,14 +3,15 @@ import pandas as pd
 import cv2 
 import utm
 from pathlib import Path
-from trainining_images import panorama_location, closest_panoramas_id, get_multiview, cropping_properties, save_images, pano_to_rect
+from code.training_images import panorama_location, closest_panoramas_id, get_multiview, cropping_properties, save_images, pano_to_rect
 from image_corrections import MultiViewInletClassifier, recompute_rectilinear
-from segmentation_validate import process_image_data
+from code.segmentation_visualization import process_image_data
 from detectron2 import model_zoo
 from detectron2.config import get_cfg
 from aistron.config import add_aistron_config
 from detectron2.data import MetadataCatalog
 from detectron2.engine import DefaultPredictor
+import folium
 
 def extract_inlet_location(target_area):
     """
@@ -31,7 +32,7 @@ def extract_inlet_location(target_area):
     return inlet_locations
 
 if __name__ == '__main__':
-    """
+
     # File paths:
     base_dir = "/run/user/1000/gvfs/smb-share:server=ecresearch.uwaterloo.ca,share=cviss/Jack/baf/360streetview/deploy"
     target_area = os.path.join(base_dir, 'test_area.csv') # path to csv file containing the locations of the target inlets
@@ -48,7 +49,7 @@ if __name__ == '__main__':
     vehicle_pixel_x = 2835 # vehicle's travelling direction offset from the left of pano
 
     inlet_properties = extract_inlet_location(target_area)
-
+    """
     best_matches = {}
 
     # Iterate through all subdirectories in raw_data
@@ -148,7 +149,7 @@ if __name__ == '__main__':
     base_dir = "/run/user/1000/gvfs/smb-share:server=ecresearch.uwaterloo.ca,share=cviss/Jack/baf/360streetview/deploy"
     output_img_dir = os.path.join(base_dir, "results")
     csv_output_path = os.path.join(output_img_dir, "clogging_results.csv")
-    reprojected_images_path = os.path.join(base_dir, 'image_reprojection')
+    reprojected_images_path = os.path.join(base_dir, 'image_reprojection', 'images')
 
     # Set up configurations to deploy pretrained ORCNN model
     cfg = get_cfg()
@@ -171,22 +172,60 @@ if __name__ == '__main__':
     data_rows = []
 
     for img_name in os.listdir(reprojected_images_path):
+        img_name_path = Path(img_name)
+        inlet_id = img_name_path.stem.split('_')[0].strip()
         if img_name.lower().endswith(('.png', '.jpg', '.jpeg')):
             img_path = os.path.join(reprojected_images_path, img_name)
             save_path = os.path.join(output_img_dir, f"res_{img_name}")
             
             # Run our unified function
             row_data = process_image_data(img_path, save_path)
-            
+
             if row_data:
+                matching_inlet_row = inlet_properties.loc[inlet_properties['inlet_id'].astype(int).astype(str) == inlet_id]
+                if not matching_inlet_row.empty:
+                    inlet_row = matching_inlet_row.iloc[0]
+                    row_data.update({
+                    "Inlet_ID": inlet_id,
+                    "Latitude": inlet_row['lat'],
+                    "Longitude": inlet_row['lon']
+                    })
                 data_rows.append(row_data)
                 print(f"Processed {img_name} -> Clogging: {row_data['Clogging_Extent_%']}%")
 
     # Generate the DataFrame and save to Excel/CSV
     df = pd.DataFrame(data_rows)
+    print(df)
     df.to_csv(csv_output_path, index=False)
+
+    # Create a visualization map
+    valid_coords = df.dropna(subset=['Latitude', 'Longitude'])
+
+    if not valid_coords.empty:
+        center_lat = valid_coords['Latitude'].mean()
+        center_lon = valid_coords['Longitude'].mean()
+        
+        # Initialize the map
+        m = folium.Map(location=[center_lat, center_lon], zoom_start=17, max_zoom=22, tiles='OpenStreetMap')
+
+        # Iterate through rows and plot
+        for index, row in valid_coords.iterrows():
+            clogging_val = row['Clogging_Extent_%']           
+            color = 'red' if clogging_val > 40 else 'green'
     
-    print("\n" + "="*40)
-    print(f"Done! Results saved to {csv_output_path}")
-    print("DataFrame Preview:")
-    print(df.head())
+            folium.CircleMarker(
+                location=[row['Latitude'], row['Longitude']],
+                radius=5,
+                weight=2,
+                popup=(f"<b>Inlet ID:</b> {row['Inlet_ID']}<br>"
+                    f"<b>Clogging:</b> {clogging_val:.1f}%<br>"
+                    f"<b>Image:</b> {row['Image_Name']}"),
+                color='white',
+                fill=True,
+                fill_color=color,
+                fill_opacity=0.7
+            ).add_to(m)
+
+        # Save the map
+        map_output_path = os.path.join(output_img_dir, "clogging_map.html")
+        m.save(map_output_path)

@@ -22,21 +22,31 @@ def extract_inlet_location(waterloo_data, kitchener_data, test_area):
     """
     waterloo = pd.read_csv(waterloo_data)
     kitchener = pd.read_csv(kitchener_data)
-    inlet_locations_waterloo = pd.DataFrame(waterloo[["ASSET_ID", "y", "x"]].values, columns=["inlet_id", "lat", "lon"])
+
+    inlet_locations_waterloo = waterloo[["ASSET_ID", "y", "x"]].copy()
+    inlet_locations_waterloo.columns = ["inlet_id", "lat", "lon"]
     inlet_locations_waterloo = inlet_locations_waterloo.dropna()
 
     # Note that Kitchener database uses the UTM coordinates - therefore we must convert it to latitude and longtitude prior to processing 
-    inlet_locations_kitchener = pd.DataFrame(kitchener[["OBJECTID", "x", "y"]].values, columns=["inlet_id", "utme", "utmn"])
+    inlet_locations_kitchener = kitchener[["OBJECTID", "x", "y"]].copy()
+    inlet_locations_kitchener.columns = ["inlet_id", "utme", "utmn"]
     inlet_locations_kitchener = inlet_locations_kitchener.dropna()
-    inlet_locations_kitchener[["lat", "lon"]] = inlet_locations_kitchener.apply(lambda row: utm.to_latlon(row['utme'], row['utmn'], 17, northern=True), axis=1, result_type='expand')
+    
+    inlet_locations_kitchener[["lat", "lon"]] = inlet_locations_kitchener.apply(
+        lambda row: utm.to_latlon(row['utme'], row['utmn'], 17, northern=True), 
+        axis=1, 
+        result_type='expand'
+    )
     inlet_locations_kitchener = inlet_locations_kitchener.drop(columns=['utme', 'utmn'])
 
     # Combine the databases
     inlet_locations = pd.concat([inlet_locations_waterloo, inlet_locations_kitchener], axis=0, ignore_index=True)
+    inlet_locations['inlet_id'] = inlet_locations['inlet_id'].astype(int).astype(str)
 
     # Filter out the inlets in the test area
     test_area_df = pd.read_csv(test_area)
     test_inlet_ids = test_area_df['OBJECTID'].astype(str).tolist()
+
     indices_to_drop = inlet_locations[inlet_locations['inlet_id'].isin(test_inlet_ids)].index
     inlet_locations = inlet_locations.drop(indices_to_drop)
 
@@ -107,7 +117,7 @@ def closest_panoramas_id(inlet_locations, pano_locations):
         if dist_m < 10:
             nearest_index = index[0][0]
             pano_id = float(pano_locations.iloc[nearest_index]['panoramas_id'])
-            inlet_id = int(inlet_locations.iloc[i]['inlet_id'])
+            inlet_id = str(inlet_locations.iloc[i]['inlet_id'])
             results.append([inlet_id, pano_id, dist_m])
     return results
 
@@ -291,7 +301,7 @@ if __name__ == '__main__':
     vehicle_pixel_x = 2835 # vehicle's travelling direction offset from the left of pano
 
     inlet_properties = extract_inlet_location(waterloo_data, kitchener_data, test_area)
-    
+
     # List to aggregate all heading and pitch data across folders
     best_matches = {}
 
@@ -359,4 +369,3 @@ if __name__ == '__main__':
         os.makedirs(save_path, exist_ok=True)
 
         cv2.imwrite(os.path.join(save_path, image_name.name), rect_img)
-

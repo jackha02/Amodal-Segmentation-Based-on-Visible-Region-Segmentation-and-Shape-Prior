@@ -5,7 +5,7 @@ import math
 from ultralytics import YOLO
 import pandas as pd
 from pathlib import Path
-from trainining_images import pano_to_rect
+from training_images import pano_to_rect
 
 class MultiViewInletClassifier:
     """

@@ -1,15 +1,45 @@
 import numpy as np
 import os
 import cv2
-import numpy as np
+import torch
+import json
+import shutil
+import random
 
 from detectron2.engine import DefaultTrainer, DefaultPredictor
 from detectron2.config import get_cfg
 from detectron2 import model_zoo
 from detectron2.data.datasets import register_coco_instances
+from detectron2.data import DatasetMapper, build_detection_train_loader
+import detectron2.data.transforms as T
 from aistron.config import add_aistron_config
 
-# AIStron is an open-source toolbox used for Amodal Instance Segmentation methods
+# Custom Trainer for Online Augmentation
+class CustomTrainer(DefaultTrainer):
+    @classmethod
+    def build_train_loader(cls, cfg):
+        augmentations = [
+            # Standard resize with scaling variance (Equivalent to scale=0.2 / translate=0.1)
+            T.ResizeShortestEdge(
+                short_edge_length=(640, 672, 704, 736, 768, 800), 
+                max_size=1333, 
+                sample_style="choice"
+            ),
+            # Geometric: 50% chance to flip horizontally (fliplr=0.5)
+            T.RandomFlip(prob=0.5, horizontal=True, vertical=False),
+            
+            # Photometric: Value/Brightness shift +/- 20% (hsv_v=0.2)
+            T.RandomBrightness(0.8, 1.2),
+            
+            # Photometric: Saturation shift +/- 30% (hsv_s=0.3)
+            T.RandomSaturation(0.7, 1.3),
+            
+            # Photometric: Contrast shift to help substitute for Hue (hsv_h)
+            T.RandomContrast(0.8, 1.2)
+        ]
+        
+        mapper = DatasetMapper(cfg, is_train=True, augmentations=augmentations)
+        return build_detection_train_loader(cfg, mapper=mapper)
 
 def train_orcnn_model(dataset_dir):
     """
@@ -24,6 +54,10 @@ def train_orcnn_model(dataset_dir):
     # Setup the Configuration
     cfg = get_cfg() # copy of the default configuration
     add_aistron_config(cfg) # add amodal segmentation capabilities
+    
+    # File paths
+    base_dir = "/run/user/1000/gvfs/smb-share:server=ecresearch.uwaterloo.ca,share=cviss/Jack/baf/360streetview"
+    cfg.OUTPUT_DIR = os.path.join(base_dir, 'trained_models', 'test')
     
     # Find a model from detectron2's 
     cfg.merge_from_file(model_zoo.get_config_file("COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"))
@@ -44,9 +78,8 @@ def train_orcnn_model(dataset_dir):
     cfg.MODEL.DEVICE = "cuda"            # Force the use of the GPU
 
     # Start Training
-    import os
     os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
-    trainer = DefaultTrainer(cfg)
+    trainer = CustomTrainer(cfg)
     trainer.resume_or_load(resume=False)
     trainer.train()
     
@@ -111,11 +144,6 @@ def calculate_clogging_extent(image_path, cfg):
     print(f"Final Clogging Extent: {clogging_extent:.2f}%")
     
     return clogging_extent
-
-import os
-import json
-import shutil
-import random
 
 def data_split(images_dir, single_json_file, dataset_dir, validation_ratio=0.2):
     """
@@ -193,25 +221,20 @@ def data_split(images_dir, single_json_file, dataset_dir, validation_ratio=0.2):
     print(f"Training: {len(train_images)} images, {len(train_anns)} annotations.")
     print(f"Validation: {len(val_images)} images, {len(val_anns)} annotations.")
 
-
 if __name__ == '__main__':
 
-    # File paths
+    torch.cuda.empty_cache()
+
+    # File paths    
     base_dir = "/run/user/1000/gvfs/smb-share:server=ecresearch.uwaterloo.ca,share=cviss/Jack/baf/360streetview"
-    training_images = os.path.join(base_dir, 'segmentation_training', 'dataset', 'images') 
-    training_labels = os.path.join(base_dir, 'segmentation_training', 'dataset', 'labels_my-project-name_2026-03-09-02-16-21.json')
-    dataset_dir = os.path.join(base_dir, 'segmentation_training', 'dataset')
-    new_img = os.path.join(base_dir, 'final', 'images', '10251921_leaving.png')
-    results = os.path.join(base_dir, 'final', 'results')
-    """
+    training_images = os.path.join(base_dir, 'segmentation_training', 'synthetic', 'copy_paste', 'dataset', 'images') 
+    training_labels = os.path.join(base_dir, 'segmentation_training', 'synthetic', 'copy_paste', 'dataset', 'synthetic.json')
+    dataset_dir = os.path.join(base_dir, 'segmentation_training', 'synthetic', 'copy_paste', 'dataset')
+ 
     # Split the datasets for training and validation 
+
     data_split(training_images, training_labels, dataset_dir, validation_ratio=0.2)  
 
+    
     # Train the ORCNN model
     cfg = train_orcnn_model(dataset_dir)
-    """
-
-    cfg = get_cfg()
-    test_image = os.path.join(new_img, "some_test_image.jpg") # Replace with a real image name
-    extent = calculate_clogging_extent(test_image, cfg)
-    print(f"The clogging extent for this image is: {extent}%")

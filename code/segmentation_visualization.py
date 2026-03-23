@@ -10,9 +10,7 @@ from detectron2.data import MetadataCatalog
 from detectron2.utils.visualizer import Visualizer, ColorMode
 from detectron2.engine import DefaultPredictor
 
-# ==========================================
-# 1. SETUP CONFIGURATION
-# ==========================================
+
 cfg = get_cfg()
 add_aistron_config(cfg)
 cfg.merge_from_file(model_zoo.get_config_file("COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"))
