@@ -4,3 +4,6 @@
 [submodule "code/code/Equirec2Perspec"]
 	path = code/code/Equirec2Perspec
 	url = https://github.com/fuenwang/Equirec2Perspec.git
+[submodule "Amodal-Segmentation-Based-on-Visible-Region-Segmentation-and-Shape-Prior"]
+	path = Amodal-Segmentation-Based-on-Visible-Region-Segmentation-and-Shape-Prior
+	url = git@github.com:jackha02/Amodal-Segmentation-Based-on-Visible-Region-Segmentation-and-Shape-Prior.git
