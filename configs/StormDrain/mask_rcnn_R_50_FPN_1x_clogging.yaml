@@ -1,0 +1,29 @@
+_BASE_: "../Base-RCNN-FPN.yaml"
+
+MODEL:
+  WEIGHTS: "detectron2://ImageNetPretrained/MSRA/R-50.pkl"
+  MASK_ON: True
+
+  ROI_HEADS:
+    NAME: "StandardROIHeads"
+    NUM_CLASSES: 1            # storm drain inlet — single class
+
+  ROI_MASK_HEAD:
+    NAME: "ParallelAmodalMaskHeadClogging"
+    CONV_DIM: 256
+    FM_LAMBDAS: [0.01, 0.05]
+    UNET_BASE_CHANNELS: 16
+    UNET_DEPTH: 3
+
+DATASETS:
+  TRAIN: ("storm_drain_train",)
+  TEST:  ("storm_drain_val",)
+
+SOLVER:
+  IMS_PER_BATCH: 4
+  BASE_LR: 0.001
+  MAX_ITER: 70000
+  STEPS: (50000, 65000)
+  CHECKPOINT_PERIOD: 5000
+
+OUTPUT_DIR: "/run/user/1000/gvfs/smb-share:server=ecresearch.uwaterloo.ca,share=cviss/Jack/baf/360streetview/trained_models/segmentation"

@@ -2,7 +2,10 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 # import torch
-from detectron2 import _C
+try:
+    from detectron2 import _C
+except (ModuleNotFoundError, ImportError):
+    _C = None
 
 
 def pairwise_iou_rotated(boxes1, boxes2):

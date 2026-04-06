@@ -1,10 +1,30 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+import torch
 from torch import nn
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 from torch.nn.modules.utils import _pair
 
-from detectron2 import _C
+try:
+    from detectron2 import _C
+    _C_AVAILABLE = hasattr(_C, "roi_align_forward")
+except (ModuleNotFoundError, ImportError):
+    _C_AVAILABLE = False
+
+
+def _tv_roi_align(input, roi, output_size, spatial_scale, sampling_ratio, aligned):
+    """Fallback to torchvision.ops.roi_align when _C is not compiled."""
+    import torchvision.ops as tvops
+    # torchvision roi_align expects boxes as (batch_idx, x1, y1, x2, y2)
+    # with values already in the original image scale — same as detectron2.
+    return tvops.roi_align(
+        input,
+        roi,
+        output_size=output_size,
+        spatial_scale=spatial_scale,
+        sampling_ratio=sampling_ratio if sampling_ratio > 0 else -1,
+        aligned=aligned,
+    )
 
 
 class _ROIAlign(Function):
@@ -16,9 +36,12 @@ class _ROIAlign(Function):
         ctx.sampling_ratio = sampling_ratio
         ctx.input_shape = input.size()
         ctx.aligned = aligned
-        output = _C.roi_align_forward(
-            input, roi, spatial_scale, output_size[0], output_size[1], sampling_ratio, aligned
-        )
+        if _C_AVAILABLE:
+            output = _C.roi_align_forward(
+                input, roi, spatial_scale, output_size[0], output_size[1], sampling_ratio, aligned
+            )
+        else:
+            output = _tv_roi_align(input, roi, _pair(output_size), spatial_scale, sampling_ratio, aligned)
         return output
 
     @staticmethod
@@ -29,19 +52,27 @@ class _ROIAlign(Function):
         spatial_scale = ctx.spatial_scale
         sampling_ratio = ctx.sampling_ratio
         bs, ch, h, w = ctx.input_shape
-        grad_input = _C.roi_align_backward(
-            grad_output,
-            rois,
-            spatial_scale,
-            output_size[0],
-            output_size[1],
-            bs,
-            ch,
-            h,
-            w,
-            sampling_ratio,
-            ctx.aligned,
-        )
+        if _C_AVAILABLE:
+            grad_input = _C.roi_align_backward(
+                grad_output,
+                rois,
+                spatial_scale,
+                output_size[0],
+                output_size[1],
+                bs,
+                ch,
+                h,
+                w,
+                sampling_ratio,
+                ctx.aligned,
+            )
+        else:
+            # torchvision does not expose a standalone backward; use autograd
+            import torchvision.ops as tvops
+            with torch.enable_grad():
+                inp = torch.zeros(bs, ch, h, w, requires_grad=True)
+                out = tvops.roi_align(inp, rois, output_size, spatial_scale, sampling_ratio, ctx.aligned)
+            grad_input = torch.autograd.grad(out, inp, grad_output)[0]
         return grad_input, None, None, None, None, None
 
 

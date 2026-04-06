@@ -13,8 +13,6 @@ torch_ver = [int(x) for x in torch.__version__.split(".")[:2]]
 assert torch_ver >= [1, 3], "Requires PyTorch >= 1.3"
 
 nvcc_args = [
-    '-gencode', 'arch=compute_30,code=sm_30',
-    '-gencode', 'arch=compute_35,code=sm_35',
     '-gencode', 'arch=compute_37,code=sm_37',
     '-gencode', 'arch=compute_50,code=sm_50',
     '-gencode', 'arch=compute_52,code=sm_52',

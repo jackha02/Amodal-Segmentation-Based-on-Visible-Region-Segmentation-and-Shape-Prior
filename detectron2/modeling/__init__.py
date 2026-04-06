@@ -43,7 +43,11 @@ from .roi_heads import (
     build_keypoint_head,
     build_mask_head,
     build_roi_heads,
+    UncertaintyWeightedLoss,
 )
+
+from .roi_heads import UncertaintyWeightedLoss
+
 from .test_time_augmentation import DatasetMapperTTA, GeneralizedRCNNWithTTA
 
 _EXCLUDE = {"torch", "ShapeSpec"}
