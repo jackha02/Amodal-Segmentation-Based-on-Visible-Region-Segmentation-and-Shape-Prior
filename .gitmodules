@@ -1,6 +1,3 @@
-[submodule "model"]
-	path = model
-	url = https://github.com/jackha02/yolov5.git
 [submodule "code/code/Equirec2Perspec"]
 	path = code/code/Equirec2Perspec
 	url = https://github.com/fuenwang/Equirec2Perspec.git
