@@ -3,9 +3,9 @@ import pandas as pd
 import cv2 
 import utm
 from pathlib import Path
-from code.training_images import panorama_location, closest_panoramas_id, get_multiview, cropping_properties, save_images, pano_to_rect
+from src.training_images import panorama_location, closest_panoramas_id, get_multiview, cropping_properties, save_images, pano_to_rect
 from image_corrections import MultiViewInletClassifier, recompute_rectilinear
-from code.segmentation_visualization import process_image_data
+from src.segmentation_visualization import process_image_data
 from detectron2 import model_zoo
 from detectron2.config import get_cfg
 from aistron.config import add_aistron_config

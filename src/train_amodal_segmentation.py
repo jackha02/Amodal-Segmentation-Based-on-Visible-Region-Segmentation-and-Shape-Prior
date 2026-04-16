@@ -153,13 +153,16 @@ sys.path.insert(0, REPO_DIR)
 
 import numpy as np
 import torch
+import cv2
+
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
 from detectron2.data import detection_utils as utils
 from detectron2.data import transforms as T
+from detectron2.evaluation import inference_on_dataset
 
 from detectron2.data import DatasetCatalog, MetadataCatalog
-from detectron2.data.datasets import register_coco_instances
+from detectron2.structures import BoxMode
 from detectron2.engine import DefaultTrainer, default_setup, launch
 from detectron2.evaluation import COCOEvaluator
 from detectron2.config import add_clogging_config 
@@ -172,6 +175,7 @@ from detectron2.modeling.roi_heads import (
     select_foreground_proposals,
 )
 from detectron2.structures import pairwise_iou
+from detectron2.engine.hooks import HookBase
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +212,187 @@ class CloggingROIHeads(StandardROIHeads):
             mask_features = self.mask_pooler(features, pred_boxes)
             # Pass instances so the head can attach predictions per image.
             return self.mask_head(mask_features, instances)
+
+
+# ---------------------------------------------------------------------------
+# Custom RandomRotation Transform — preserves both visible and amodal masks
+# ---------------------------------------------------------------------------
+
+class RandomRotation(T.Transform):
+    """
+    Custom rotation transform for Detectron2 v0.1 that rotates images and
+    all associated polygons (both amodal and visible segmentation masks).
+    
+    Parameters
+    ----------
+    angle : float
+        Rotation angle in degrees (positive = counter-clockwise)
+    expand : bool
+        If True, expand output image to fit the rotated content (may create
+        canvas larger than input). If False, crop to input size.
+    """
+    def __init__(self, angle, expand=False):
+        super().__init__()
+        self.angle = angle
+        self.expand = expand
+        self._original_shape = None  # Will store (h, w) during apply_image
+        self._set_attributes(locals())
+    
+    def apply_image(self, img):
+        """Rotate image using cv2.warpAffine"""
+        h, w = img.shape[:2]
+        self._original_shape = (h, w)  # Store for use in apply_coords
+        center = (w / 2.0, h / 2.0)
+        
+        # Get rotation matrix
+        M = cv2.getRotationMatrix2D(center, self.angle, 1.0)
+        
+        if self.expand:
+            # Compute the size of the rotated image
+            cos = np.abs(M[0, 0])
+            sin = np.abs(M[0, 1])
+            new_w = int(h * sin + w * cos)
+            new_h = int(h * cos + w * sin)
+            
+            # Adjust rotation matrix to account for translation
+            M[0, 2] += (new_w / 2.0) - center[0]
+            M[1, 2] += (new_h / 2.0) - center[1]
+            
+            # Rotate and pad to new size
+            rotated = cv2.warpAffine(img, M, (new_w, new_h),
+                                    borderMode=cv2.BORDER_REFLECT_101)
+            self._new_shape = (new_h, new_w)
+            return rotated
+        else:
+            # Rotate and keep original size
+            rotated = cv2.warpAffine(img, M, (w, h),
+                                    borderMode=cv2.BORDER_REFLECT_101)
+            self._new_shape = (h, w)
+            return rotated
+    
+    def _get_rotation_matrix(self):
+        """Compute the rotation matrix for coordinate transformation"""
+        if self._original_shape is None:
+            raise RuntimeError("apply_image must be called before apply_coords")
+        
+        h, w = self._original_shape
+        center = np.array([w / 2.0, h / 2.0])
+        
+        M = cv2.getRotationMatrix2D(tuple(center), self.angle, 1.0)
+        
+        if self.expand:
+            cos = np.abs(M[0, 0])
+            sin = np.abs(M[0, 1])
+            new_w = int(h * sin + w * cos)
+            new_h = int(h * cos + w * sin)
+            
+            M[0, 2] += (new_w / 2.0) - center[0]
+            M[1, 2] += (new_h / 2.0) - center[1]
+        
+        return M
+    
+    def apply_coords(self, coords):
+        """Rotate coordinate points using the rotation matrix"""
+        if len(coords) == 0:
+            return coords
+        
+        M = self._get_rotation_matrix()
+        
+        # Apply rotation to coordinates
+        # Convert to homogeneous coordinates
+        ones = np.ones((coords.shape[0], 1))
+        coords_h = np.hstack([coords, ones])  # shape: (N, 3)
+        
+        # Apply transformation: (2x3) @ (3xN) = (2xN)
+        rotated_coords = (M @ coords_h.T).T  # shape: (N, 2)
+        
+        # Clip to valid image range if not expanding
+        if not self.expand and self._new_shape is not None:
+            h, w = self._new_shape
+            rotated_coords = np.clip(rotated_coords, 0, [w, h])
+        
+        return rotated_coords
+    
+    def apply_segmentation(self, segmentation):
+        """
+        Rotate polygon segmentation.
+        Detectron2 uses list of lists format: [[x0, y0, x1, y1, ...], ...]
+        """
+        if not segmentation:
+            return segmentation
+        
+        rotated_segs = []
+        for polygon in segmentation:
+            if len(polygon) < 6:  # Skip degenerate polygons
+                rotated_segs.append(polygon)
+                continue
+            
+            # Convert to coordinate array
+            coords = np.array(polygon, dtype=np.float32).reshape(-1, 2)
+            
+            # Rotate coordinates
+            rotated = self.apply_coords(coords)
+            
+            # Convert back to flat list
+            rotated_segs.append(rotated.flatten().tolist())
+        
+        return rotated_segs
+
+
+class ApplyRandomRotation(T.TransformGen):
+    """
+    Augmentation wrapper for RandomRotation that samples random angles
+    (Detectron2 v0.1 compatible).
+    
+    Parameters
+    ----------
+    angle_range : tuple of (min_angle, max_angle)
+        Range of rotation angles in degrees
+    p : float
+        Probability of applying rotation (0.0 to 1.0)
+    expand : bool
+        If True, expand canvas to fit rotated image; if False, keep original size
+    """
+    def __init__(self, angle_range=(-15, 15), p=0.5, expand=False):
+        super().__init__()
+        self.angle_range = angle_range
+        self.prob = p
+        self.expand = expand
+        self._init(locals())
+    
+    def get_transform(self, image):
+        if self._rand_range() > self.prob:
+            # Return identity transform (no rotation)
+            return T.NoOpTransform()
+        
+        angle = np.random.uniform(self.angle_range[0], self.angle_range[1])
+        return RandomRotation(angle, expand=self.expand)
+
+
+class ApplyRandomVerticalFlip(T.TransformGen):
+    """
+    Vertical flip augmentation (Detectron2 v0.1 compatible).
+    
+    Handles vertical flipping of images and associated polygon annotations
+    to account for camera tilt variations. This is distinct from horizontal
+    flipping and helps the model to be invariant to vertical camera angles.
+    
+    Parameters
+    ----------
+    prob : float
+        Probability of applying vertical flip (0.0 to 1.0), default 0.5
+    """
+    def __init__(self, prob=0.5):
+        super().__init__()
+        self.prob = prob
+        self._init(locals())
+    
+    def get_transform(self, image):
+        if self._rand_range() > self.prob:
+            return T.NoOpTransform()
+        h = image.shape[0]
+        return T.VFlipTransform(h)
+
 
 logger = logging.getLogger("detectron2")
 
@@ -282,10 +467,52 @@ def register_fold_datasets(train_data, val_data, img_dir, fold, tmp_dir):
     train_name = f"storm_drain_fold{fold}_train"
     val_name   = f"storm_drain_fold{fold}_val"
 
-    for name, path in [(train_name, train_json), (val_name, val_json)]:
+    for name, path, in [(train_name, train_json), (val_name, val_json)]:
         if name in DatasetCatalog.list():
             DatasetCatalog.remove(name)
-        register_coco_instances(name, {}, path, img_dir)
+        # Use a custom loader instead of register_coco_instances so that
+        # non-standard annotation fields (clogging_extent, visible_segmentation)
+        # are preserved — register_coco_instances uses Detectron2's COCO loader
+        # which silently drops any field not in the official COCO spec.
+        _path, _img_dir = path, img_dir  # capture loop vars
+        def _make_loader(json_path, images_dir):
+            def _loader():
+                with open(json_path) as f:
+                    data = json.load(f)
+                id_to_img = {img["id"]: img for img in data["images"]}
+                anns_by_image = {}
+                for ann in data["annotations"]:
+                    anns_by_image.setdefault(ann["image_id"], []).append(ann)
+                dataset_dicts = []
+                for img in data["images"]:
+                    img_id = img["id"]
+                    record = {
+                        "file_name":    os.path.join(images_dir, img["file_name"]),
+                        "image_id":     img_id,
+                        "height":       img["height"],
+                        "width":        img["width"],
+                        "annotations":  [],
+                    }
+                    for ann in anns_by_image.get(img_id, []):
+                        obj = {
+                            "id":           ann["id"],
+                            "bbox":         ann["bbox"],
+                            "bbox_mode":    BoxMode.XYWH_ABS,
+                            "category_id":  0,  # single class
+                            "segmentation": ann.get("segmentation", []),
+                            "iscrowd":      ann.get("iscrowd", 0),
+                            "area":         ann.get("area", 0),
+                        }
+                        # Preserve custom fields
+                        if "clogging_extent" in ann:
+                            obj["clogging_extent"] = ann["clogging_extent"]
+                        if "visible_segmentation" in ann:
+                            obj["visible_segmentation"] = ann["visible_segmentation"]
+                        record["annotations"].append(obj)
+                    dataset_dicts.append(record)
+                return dataset_dicts
+            return _loader
+        DatasetCatalog.register(name, _make_loader(_path, _img_dir))
         MetadataCatalog.get(name).set(thing_classes=["storm_drain"])
         logger.info(f"Registered '{name}'  ({path})")
 
@@ -294,24 +521,39 @@ def register_fold_datasets(train_data, val_data, img_dir, fold, tmp_dir):
 def build_custom_transforms(is_train):
     """
     Returns a list of Transform objects for data augmentation.
+    
+    CRITICAL: Includes scale augmentation to handle domain shift between
+    synthetic training (245px inlets) and real test (315px inlets).
+    
+    Augmentations include:
+    - Scale: ±30% to handle domain shift (synthetic 245px vs real 315px inlets)
+    - Rotation: ±15 degrees (50% probability) to handle viewing angle variations
+    - Scaling: ±20% to handle focal length variations and scale mismatches
+    - Horizontal flip: 50% probability for natural scene augmentation
+    - Vertical flip: 50% probability to handle camera angle variations
+    - Photometric: brightness, saturation, and lighting adjustments
     """
     if is_train:
         return [
+            # ===== SCALE AUGMENTATION (CRITICAL FOR GENERALIZATION) =====
+            # Synthetic inlets: ~245x245 px (area 60K px²)
+            # Real inlets: ~315x315 px (area 99K px²) = 65% LARGER
+            # Use T.RandomExtent with ±30% scale range (0.7-1.3)
+            T.RandomExtent(scale_range=(0.7, 1.3), shift_range=(0.0, 0.0)),
+            # ================================================================
+            
             # Geometric augmentations
-            T.RandomApply(T.RandomRotation(angle=[-30, 30]), prob=1.0),  # ±30° rotation
-            T.RandomApply(T.RandomExtent(scale_range=(0.8, 1.2), shift_range=(0.0, 0.0)), prob=1.0),  # ±20% scaling, no translation
-            T.RandomFlip(prob=0.5, horizontal=True, vertical=False),  # 50% horizontal flip
-            T.RandomFlip(prob=0.5, horizontal=False, vertical=True),  # 50% vertical flip
+            ApplyRandomRotation(angle_range=(-15, 15), p=0.5, expand=False),  # Rotation to mimic viewpoint variations
+            T.RandomFlip(prob=0.5),          # 50% horizontal flip
+            ApplyRandomVerticalFlip(prob=0.5),  # 50% vertical flip to handle camera tilt variations
 
             # Photometric augmentations
-            T.RandomBrightness(intensity_min=0.7, intensity_max=1.3),  # ±30% brightness
-            T.RandomSaturation(intensity_min=0.7, intensity_max=1.3),  # ±30% saturation
-            T.RandomLighting(intensity_min=0.985, intensity_max=1.015), # ±1.5% hue (approximate)
+            T.RandomBrightness(intensity_min=0.7, intensity_max=1.3),         # ±30% brightness
+            T.RandomSaturation(intensity_min=0.7, intensity_max=1.3),         # ±30% saturation
+            T.RandomLighting(scale=0.03)                                     # ±3% lighting variation (approximate)
         ]
     else:
-        return [
-            T.ResizeShortestEdge(short_edge_length=640, max_size=640)  # consistent max_size
-        ]
+        return []
     
 class CloggingDatasetMapper:
     """
@@ -339,19 +581,35 @@ class CloggingDatasetMapper:
         annos = dataset_dict.pop("annotations")
         annos = [obj for obj in annos if obj.get("iscrowd", 0) == 0]
 
-        # Apply geometric transforms to standard fields (bbox, amodal segmentation)
-        annos = [
-            utils.transform_instance_annotations(obj, transforms, image.shape[:2])
-            for obj in annos
-        ]
-
-        # Map visible_segmentation -> visible_mask (expected by the repo's annotations_to_instances)
+        # Map visible_segmentation -> visible_mask BEFORE transforms so it gets
+        # spatially transformed alongside "segmentation" and "bbox"
         for obj in annos:
             if "visible_mask" not in obj:
                 obj["visible_mask"] = obj.get("visible_segmentation", obj.get("segmentation", []))
 
-        # Build standard instances (uses "segmentation" as the amodal mask)
+        # Apply geometric transforms to standard fields (bbox, amodal segmentation, visible_mask)
+        # ===== CRITICAL: transform_instance_annotations ALSO handles visible_mask polygons =====
+        # We must keep visible_mask as polygons for transforms to work, then pop before annotations_to_instances
+        transformed_annos = []
+        for obj in annos:
+            obj_transformed = utils.transform_instance_annotations(obj, transforms, image.shape[:2])
+            transformed_annos.append(obj_transformed)
+        
+        annos = transformed_annos
+
+        # ===== CRITICAL: Extract visible_mask but KEEP it in obj for detection_utils =====
+        # detection_utils.annotations_to_instances expects visible_mask to exist (line 261)
+        # We extract it to handle manually, but also need to keep it for detection_utils
+        # Otherwise: KeyError at detection_utils.py:261 trying to access obj["visible_mask"]
+        
+        extracted_visible_masks = []
+        for obj in annos:
+            vis_mask = obj.get("visible_mask", [])  # Extract a copy, keep original in obj
+            extracted_visible_masks.append(vis_mask)
+
+        # Build standard instances (only processes "segmentation" as amodal mask)
         instances = utils.annotations_to_instances(annos, image.shape[:2])
+
 
         # --- Parse visible_segmentation into gt_masks_visible ---
         # Rename amodal masks (built from "segmentation") to gt_masks_amodal
@@ -359,19 +617,55 @@ class CloggingDatasetMapper:
             instances.gt_masks_amodal = instances.gt_masks
             instances.remove("gt_masks")  # remove the generic field to avoid ambiguity
 
-        visible_polygons = []
+        # Extract clogging extents
         clogging_extents = []
         for obj in annos:
-            # visible_segmentation uses the same polygon format as segmentation
-            vis_seg = obj.get("visible_segmentation", obj.get("segmentation", []))
-            visible_polygons.append(vis_seg)
             clogging_extents.append(float(obj.get("clogging_extent", 0.0)))
 
-        # Convert visible polygons to BitMasks (same spatial size as amodal)
+        # ===== Manually convert extracted visible_mask polygons to binary masks =====
         h, w = image.shape[:2]
-        from detectron2.structures import PolygonMasks
-        vis_masks = PolygonMasks(visible_polygons)
-        instances.gt_masks_visible = vis_masks
+        
+        visible_masks_binary = []
+        for vis_mask in extracted_visible_masks:
+            if vis_mask is not None:
+                # vis_mask should be a polygon list from transform_instance_annotations
+                if isinstance(vis_mask, np.ndarray):
+                    # Already a binary mask - keep as is
+                    if vis_mask.ndim == 2:
+                        visible_masks_binary.append(vis_mask.astype(np.uint8))
+                    else:
+                        logger.warning(f"visible_mask unexpected shape {vis_mask.shape}; using zero mask")
+                        visible_masks_binary.append(np.zeros((h, w), dtype=np.uint8))
+                elif isinstance(vis_mask, list) and len(vis_mask) > 0:
+                    # It's a polygon list - rasterize to binary mask
+                    try:
+                        binary_mask = np.zeros((h, w), dtype=np.uint8)
+                        # vis_mask is a list of polygons, each polygon is [[x1,y1], [x2,y2], ...]
+                        for poly in vis_mask:
+                            if isinstance(poly, np.ndarray):
+                                poly = poly.tolist()
+                            if isinstance(poly, list) and len(poly) >= 6:  # Minimum 3 points
+                                pts = np.array(poly, dtype=np.int32).reshape(-1, 2)
+                                cv2.fillPoly(binary_mask, [pts], 1)
+                        visible_masks_binary.append(binary_mask)
+                    except Exception as e:
+                        logger.warning(f"Failed to rasterize visible_mask: {e}; using zero mask")
+                        visible_masks_binary.append(np.zeros((h, w), dtype=np.uint8))
+                else:
+                    # Empty or invalid visible_mask
+                    visible_masks_binary.append(np.zeros((h, w), dtype=np.uint8))
+            else:
+                visible_masks_binary.append(np.zeros((h, w), dtype=np.uint8))
+
+        # Create BitMasks for visible masks
+        if visible_masks_binary:
+            vis_masks_stack = torch.stack([
+                torch.from_numpy(m.astype(np.uint8))
+                for m in visible_masks_binary
+            ])
+            instances.gt_masks_visible = BitMasks(vis_masks_stack)
+
+
 
         # Attach clogging extents as a float tensor
         instances.gt_clogging_extent = torch.tensor(clogging_extents, dtype=torch.float32)
@@ -440,7 +734,10 @@ class CloggingEvaluator(COCOEvaluator):
                 continue
 
             # Handle spatial matching using IoU for images with multiple drains
-            iou_matrix = pairwise_iou(pred_inst.pred_boxes, gt_inst.gt_boxes)
+            iou_matrix = pairwise_iou(
+                pred_inst.pred_boxes.to("cpu"),
+                gt_inst.gt_boxes.to("cpu"),
+            )
             
             pred_clog = pred_inst.pred_clogging_extent.cpu()
             gt_clog   = gt_inst.gt_clogging_extent.cpu()
@@ -463,18 +760,93 @@ class CloggingEvaluator(COCOEvaluator):
                 f"Clogging extent MAE: {mae:.4f}  "
                 f"({len(self._clogging_errors)} instances)"
             )
-            results["clogging_mae"] = mae
+            results["clogging"] = {"MAE": mae}
         else:
             logger.warning(
                 "No clogging extent predictions collected. "
                 "Verify that gt_clogging_extent is set by the dataset mapper "
                 "and pred_clogging_extent is set by the mask head inference path."
             )
-            results["clogging_mae"] = float("nan")
+            results["clogging"] = {"MAE": float("nan")}
 
         return results
 
 # Model trainer
+
+class ValidationEvaluationHook(HookBase):
+    """
+    Custom hook to run validation evaluation periodically during training and
+    log metrics to TensorBoard.
+    
+    This enables real-time monitoring of validation AP, AP50, and clogging MAE
+    during training without waiting for the full training run to complete.
+    """
+    def __init__(self, cfg, eval_period, eval_function):
+        """
+        Parameters
+        ----------
+        cfg : CfgNode
+            Detectron2 config node with DATASETS.TEST set
+        eval_period : int
+            Number of training iterations between validation runs
+            Recommended: check validation every 500-1000 iterations
+        eval_function : callable
+            Function that performs evaluation (e.g., trainer.test)
+            Should return a dict with metrics
+        """
+        self.cfg = cfg
+        self.eval_period = eval_period
+        self.eval_function = eval_function
+        self._do_train = True
+
+    def before_train(self):
+        """Initialize storage hook for TensorBoard metrics"""
+        self.storage = self.trainer.storage
+
+    def after_step(self):
+        """Run validation periodically during training"""
+        next_iter = self.trainer.iter + 1
+        
+        # Run evaluation every eval_period iterations
+        if (self.eval_period > 0) and (next_iter % self.eval_period) == 0:
+            self._do_evaluate()
+
+    def _do_evaluate(self):
+        """Execute validation and log metrics to TensorBoard"""
+        logger.info(
+            f"Running validation evaluation at iteration {self.trainer.iter}..."
+        )
+        
+        # Run evaluation
+        results = self.eval_function(self.cfg, self.trainer.model)
+        
+        # Extract and log metrics
+        if results and "segm" in results:
+            # Log amodal mask metrics
+            for metric_name in ["AP", "AP50", "AP75", "APs", "APm", "APl"]:
+                if metric_name in results["segm"]:
+                    metric_value = results["segm"][metric_name]
+                    self.storage.put_scalar(
+                        f"eval/segm_{metric_name}",
+                        metric_value,
+                        smoothing_hint=False
+                    )
+            
+            logger.info(
+                f"  Amodal AP: {results['segm'].get('AP', float('nan')):.2f}, "
+                f"AP50: {results['segm'].get('AP50', float('nan')):.2f}"
+            )
+        
+        # Log clogging extent MAE
+        if results and "clogging" in results:
+            mae = results["clogging"].get("MAE", float("nan"))
+            self.storage.put_scalar(
+                "eval/clogging_mae",
+                mae,
+                smoothing_hint=False
+            )
+            logger.info(f"  Clogging MAE: {mae:.4f}")
+
 
 class StormDrainTrainer(DefaultTrainer):
     """
@@ -483,9 +855,11 @@ class StormDrainTrainer(DefaultTrainer):
     No other customisation is needed:
     - ParallelAmodalMaskHeadClogging is resolved from Detectron2's registry
       via the MODEL.ROI_MASK_HEAD.NAME config node.
-    - The UncertaintyWeightedLoss log_var parameters are nn.Parameters inside
-      a registered sub-module and are automatically picked up by
-      build_optimizer() without any extra configuration.
+    - All mask losses are returned as a named dict from the mask head and
+      are automatically summed by Detectron2's training loop.  lambda_clog
+      (MODEL.ROI_MASK_HEAD.LAMBDA_CLOG) scales the clogging MAE term relative
+      to the seven BCE terms; adjust via the config YAML if the clogging MAE
+      plateaus before the mask AP has converged.
     """
     @classmethod
     def build_train_loader(cls, cfg):
@@ -508,6 +882,35 @@ class StormDrainTrainer(DefaultTrainer):
             distributed=True,
             output_dir=output_folder,
         )
+    
+    def build_hooks(self):
+        """
+        Build a set of default hooks including periodic validation evaluation.
+        
+        This extends the default trainer hooks to include validation evaluation
+        during training, enabling real-time monitoring of validation metrics
+        via TensorBoard.
+        """
+        # Get the default hooks from parent class
+        hooks = super().build_hooks()
+        
+        # Add validation evaluation hook
+        # Runs validation every 500 iterations to monitor AP, AP50, and clogging MAE
+        eval_period = self.cfg.TEST.EVAL_PERIOD if hasattr(self.cfg.TEST, "EVAL_PERIOD") else 500
+        
+        if eval_period > 0 and len(self.cfg.DATASETS.TEST) > 0:
+            eval_hook = ValidationEvaluationHook(
+                self.cfg,
+                eval_period=eval_period,
+                eval_function=self.__class__.test
+            )
+            hooks.insert(-1, eval_hook)  # Insert before the checkpointer hook
+        
+        return hooks
+    
+    # NOTE: BestCheckpointer not available in this detectron2 version.
+    # The default trainer saves model_final.pth after training completes.
+    # For tracking best validation metric, use the metrics.json output files.
 
 # Config builder
 
@@ -527,13 +930,36 @@ def build_cfg(args, train_dataset, val_dataset, output_dir):
     cfg.defrost()
     cfg.MODEL.DEVICE                = "cuda"
     cfg.VIS_PERIOD                  = 0     # disable visualisation (gt_masks renamed to gt_masks_amodal)
-    cfg.MODEL.ROI_HEADS.NAME        = "CloggingROIHeads"
-    cfg.MODEL.ROI_HEADS.NUM_CLASSES = 1
-    cfg.MODEL.ROI_MASK_HEAD.NAME    = "ParallelAmodalMaskHeadClogging"
-    cfg.MODEL.MASK_ON               = True
-    cfg.DATASETS.TRAIN              = (train_dataset,)
-    cfg.DATASETS.TEST               = (val_dataset,)
-    cfg.OUTPUT_DIR                  = output_dir
+    cfg.MODEL.ROI_HEADS.NAME              = "CloggingROIHeads"
+    cfg.MODEL.ROI_HEADS.NUM_CLASSES       = 1
+    # Domain-specific IOU thresholds for storm drain detection.
+    # Storm drain inlets are ~200×150 px.  With standard RPN thresholds
+    # [0.3, 0.7] a 128×128 anchor (IoU ≈ 0.55 with the drain) falls in the
+    # ignored gap and is never a positive example.  With ROI_HEADS threshold
+    # of 0.5, partial-overlap visible-strip proposals (IoU ~0.25–0.35)
+    # become background, removing the primary positive training signal.
+    # These values are set in the YAML config and explicitly repeated here
+    # to ensure they are not overridden by any base config inheritance.
+    cfg.MODEL.RPN.IOU_THRESHOLDS          = [0.3, 0.5]
+    cfg.MODEL.RPN.IOU_LABELS              = [0, -1, 1]
+    cfg.MODEL.ROI_HEADS.IOU_THRESHOLDS    = [0.3]
+    cfg.MODEL.ROI_HEADS.IOU_LABELS        = [0, 1]
+    cfg.MODEL.ROI_HEADS.NMS_THRESH_TEST   = 0.5
+    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5
+    cfg.TEST.DETECTIONS_PER_IMAGE         = 2   # max 2 inlets per image
+    cfg.MODEL.ROI_MASK_HEAD.NAME          = "ParallelAmodalMaskHeadClogging"
+    cfg.MODEL.MASK_ON                     = True
+    cfg.DATASETS.TRAIN                    = (train_dataset,)
+    cfg.DATASETS.TEST                     = (val_dataset,)
+    cfg.OUTPUT_DIR                        = output_dir
+    
+    # ===== TensorBoard Logging Configuration =====
+    # Enable TensorBoard logging to track training/validation metrics in real-time
+    cfg.SOLVER.LOG_EVERY_N_ITERS          = 50        # log training loss every 50 iterations
+    
+    # Validation evaluation during training
+    # Run validation every 500 iterations to monitor AP and clogging_mae
+    cfg.TEST.EVAL_PERIOD                  = 500
 
     if args.weights:
         cfg.MODEL.WEIGHTS = args.weights
@@ -566,15 +992,41 @@ def run_single_fold(args, train_dataset, val_dataset, output_dir):
     cfg = build_cfg(args, train_dataset, val_dataset, output_dir)
     default_setup(cfg, args)
 
-    if args.eval_only:
-        model = StormDrainTrainer.build_model(cfg)
+    final_ckpt = os.path.join(output_dir, "model_final.pth")
+    # IMPORTANT: do NOT auto-skip training when model_final.pth exists.
+    # Previously "eval_only = args.eval_only or os.path.isfile(final_ckpt)" caused
+    # every re-run in the same output_dir to silently skip training and evaluate the
+    # old checkpoint — making code changes appear to have no effect and giving
+    # identical "training" times for different datasets (only eval was running).
+    # Training is now ALWAYS run unless the user explicitly sets args.eval_only=True.
+    eval_only = args.eval_only
+
+    if eval_only:
+        if not os.path.isfile(final_ckpt):
+            raise FileNotFoundError(
+                f"eval_only=True but no checkpoint found at:\n  {final_ckpt}\n"
+                "Run training first, or point args.weights at a specific checkpoint."
+            )
+        logger.info(f"  eval_only=True: loading {final_ckpt}, skipping training.")
+        cfg2 = cfg.clone()
+        cfg2.defrost()
+        cfg2.MODEL.WEIGHTS = final_ckpt
+        cfg2.freeze()
+        model = StormDrainTrainer.build_model(cfg2)
         DetectionCheckpointer(model, save_dir=output_dir).resume_or_load(
-            cfg.MODEL.WEIGHTS, resume=False
+            cfg2.MODEL.WEIGHTS, resume=False
         )
-        results = StormDrainTrainer.test(cfg, model)
+        results = StormDrainTrainer.test(cfg2, model)
     else:
+        if os.path.isfile(final_ckpt):
+            logger.info(
+                f"model_final.pth exists in {output_dir}. Will resume from last checkpoint "
+                "if available. Set args.eval_only=True to evaluate the existing model without training."
+            )
         trainer = StormDrainTrainer(cfg)
-        trainer.resume_or_load(resume=False)
+        # CRITICAL: resume=True enables checkpoint resumption after interruptions
+        # This will load the last checkpoint (stored in last_checkpoint file) if it exists
+        trainer.resume_or_load(resume=True)
         trainer.train()
         results = StormDrainTrainer.test(cfg, trainer.model)
 
@@ -628,7 +1080,16 @@ def run_kfold(args):
     tmp_dir   = os.path.join(args.output_dir, "_fold_jsons")
     all_results = []
 
+    start_fold = getattr(args, 'start_fold', 0)
     for fold in range(k):
+        root_logger = logging.getLogger("detectron2")
+        root_logger.handlers = [h for h in root_logger.handlers 
+                         if not isinstance(h, logging.FileHandler)]
+        
+        if fold < start_fold:
+            logger.info(f"  Skipping fold {fold} (start_fold={start_fold})")
+            all_results.append({})
+            continue
         logger.info(f"\n{'='*60}")
         logger.info(f"  FOLD {fold + 1} / {k}")
         logger.info(f"{'='*60}")
@@ -654,7 +1115,7 @@ def run_kfold(args):
             f"  Fold {fold}: "
             f"AP={results.get('segm', {}).get('AP',  float('nan')):.2f}  "
             f"AP50={results.get('segm', {}).get('AP50', float('nan')):.2f}  "
-            f"Clogging MAE={results.get('clogging_mae', float('nan')):.4f}"
+            f"Clogging MAE={results.get('clogging', {}).get('MAE', float('nan')):.4f}"
         )
 
     # ---- Compute mean and std across folds ---------------------------------
@@ -666,7 +1127,7 @@ def run_kfold(args):
 
     ap_vals   = [r.get("segm", {}).get("AP",   float("nan")) for r in all_results]
     ap50_vals = [r.get("segm", {}).get("AP50",  float("nan")) for r in all_results]
-    mae_vals  = [r.get("clogging_mae", float("nan")) for r in all_results]
+    mae_vals  = [r.get("clogging", {}).get("MAE", float("nan")) for r in all_results]
 
     ap_mean,   ap_std   = _stats(ap_vals)
     ap50_mean, ap50_std = _stats(ap50_vals)
@@ -720,22 +1181,23 @@ def main(args):
         logger.info("\nFinal results:")
         logger.info(f"  Amodal AP   : {results.get('segm', {}).get('AP',  'N/A')}")
         logger.info(f"  Amodal AP50 : {results.get('segm', {}).get('AP50','N/A')}")
-        logger.info(f"  Clogging MAE: {results.get('clogging_mae','N/A')}")
+        logger.info(f"  Clogging MAE: {results.get('clogging', {}).get('MAE','N/A')}")
 
 # CONFIGURATION SETTINGS
 class ConfigArgs:
-    base_dir = "/run/user/1000/gvfs/smb-share:server=ecresearch.uwaterloo.ca,share=cviss/Jack/baf/360streetview/segmentation_training"
+    base_dir = "/run/user/1000/gvfs/smb-share:server=ecresearch.uwaterloo.ca,share=cviss/Jack/baf/360streetview"
     # Required Paths
-    all_json   = os.path.join(base_dir, 'original', 'dataset', 'custom.json')  # Path to the merged COCO annotation JSON (annotations_all.json)
-    all_imgs   = os.path.join(base_dir, 'original', 'dataset', 'images')       # Path to the directory containing training images
-    output_dir = "/home/wonny/baf/360streetview/trained_models/segmentation"
+    all_json   = os.path.join(base_dir, 'segmentation_training', 'synthetic_v2', 'synthetic.json')  # v2: fixed distribution + uniform inlet sampling
+    all_imgs   = os.path.join(base_dir, 'segmentation_training', 'synthetic_v2', 'images')
+    output_dir = os.path.join(base_dir, 'trained_models', 'synthetic_final_test')
     
     # Training Mode
-    kfold = 5
+    kfold = 1
     seed = 42
+    start_fold = 0   # set > 0 to skip already-completed folds (training auto-skipped if model_final.pth exists)
     
     # Model parameters
-    config_file = "/home/wonny/baf/360streetview/Amodal-Segmentation-Based-on-Visible-Region-Segmentation-and-Shape-Prior/configs/StormDrain/mask_rcnn_R_50_FPN_1x_clogging.yaml" # defualts to a ResNet-50 backbone
+    config_file = "/home/cviss/jack/360streetview/Amodal-Segmentation-Based-on-Visible-Region-Segmentation-and-Shape-Prior/configs/StormDrain/mask_rcnn_R_50_FPN_1x_clogging.yaml" # defualts to a ResNet-50 backbone
     weights = ""
     eval_only = False # set to True to immediately run inference and evaluation
     
