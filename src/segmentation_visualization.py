@@ -174,7 +174,7 @@ def build_vis_cfg(args, checkpoint_path, dataset_name):
     cfg.MODEL.ROI_HEADS.NUM_CLASSES       = 1
     cfg.MODEL.RPN.IOU_THRESHOLDS          = [0.3, 0.5]
     cfg.MODEL.RPN.IOU_LABELS              = [0, -1, 1]
-    cfg.MODEL.ROI_HEADS.IOU_THRESHOLDS    = [0.1] # minimum IoU between gt and predicted inference
+    cfg.MODEL.ROI_HEADS.IOU_THRESHOLDS    = [0.01]
     cfg.MODEL.ROI_HEADS.IOU_LABELS        = [0, 1]
     cfg.MODEL.ROI_HEADS.NMS_THRESH_TEST   = 0.5
     cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5
@@ -822,6 +822,125 @@ def plot_clogging_error_bars(clogging_errors, actual_values, output_path, num_bi
 
 
 # ---------------------------------------------------------------------------
+# Amodal mask coordinate extraction
+# ---------------------------------------------------------------------------
+
+def mask_to_polygon_coords(binary_mask, box, img_shape):
+    """
+    Extract polygon coordinates from a binary mask using contour detection.
+    Resizes the small mask to the bounding box region and extracts contours.
+    
+    Parameters
+    ----------
+    binary_mask : np.ndarray  (H_small, W_small) binary mask at low resolution
+    box : array-like           [x1, y1, x2, y2] in image coordinates
+    img_shape : tuple          (img_h, img_w)
+    
+    Returns
+    -------
+    list of list of [x, y] 
+        List of polygons, each polygon is a list of [x, y] coordinates.
+        If no contours found, returns empty list.
+    """
+    # Resize mask to bounding box dimensions
+    x1, y1, x2, y2 = [int(round(v)) for v in box]
+    x1 = max(x1, 0)
+    y1 = max(y1, 0)
+    x2 = min(x2, img_shape[1])
+    y2 = min(y2, img_shape[0])
+    
+    w = x2 - x1
+    h = y2 - y1
+    
+    if w <= 0 or h <= 0:
+        return []
+    
+    # Resize mask to box size
+    mask_resized = cv2.resize(
+        binary_mask.astype(np.float32), 
+        (w, h), 
+        interpolation=cv2.INTER_LINEAR
+    )
+    mask_bin = (mask_resized > 0.5).astype(np.uint8) * 255
+    
+    # Extract contours
+    findContours_ret = cv2.findContours(mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Support both OpenCV 3.x and 4.x return signatures
+    if len(findContours_ret) == 2:
+        contours, _ = findContours_ret
+    else:
+        _, contours, _ = findContours_ret
+    
+    polygons = []
+    for contour in contours:
+        # Simplify contour and convert to coordinate list
+        contour = contour.squeeze().astype(float).tolist()
+        
+        # Handle single-point contours
+        if isinstance(contour[0], (int, float)):
+            contour = [contour]
+        
+        # Filter out degenerate contours (< 3 points)
+        if len(contour) < 3:
+            continue
+        
+        # Translate from box-local to image coordinates
+        polygon = [[pt[0] + x1, pt[1] + y1] for pt in contour]
+        polygons.append(polygon)
+    
+    return polygons
+
+
+def save_amodal_predictions_to_json(predictions_data, output_path):
+    """
+    Save amodal segmentation predictions to a clean JSON file.
+    
+    Parameters
+    ----------
+    predictions_data : list of dict
+        Each dict contains:
+            {
+                'image_id': int,
+                'image_filename': str,
+                'height': int,
+                'width': int,
+                'amodal_masks': [
+                    {
+                        'instance_index': int,
+                        'polygon': [[x1, y1], [x2, y2], ...]
+                    },
+                    ...
+                ]
+            }
+    output_path : str
+        Path where JSON file will be saved.
+    
+    Returns
+    -------
+    None
+    """
+    # Calculate total instances
+    total_instances = sum(len(pred['amodal_masks']) for pred in predictions_data)
+    
+    output_dict = {
+        "metadata": {
+            "total_images": len(predictions_data),
+            "total_instances": total_instances,
+            "generation_timestamp": str(np.datetime64('now')),
+        },
+        "predictions": predictions_data
+    }
+    
+    # Save with clean formatting
+    with open(output_path, 'w') as f:
+        json.dump(output_dict, f, indent=2)
+    
+    logger.info(f"Amodal predictions saved to {output_path}")
+    logger.info(f"  Total images: {len(predictions_data)}")
+    logger.info(f"  Total instances: {total_instances}")
+
+
+# ---------------------------------------------------------------------------
 # Main visualization loop
 # ---------------------------------------------------------------------------
 
@@ -875,6 +994,7 @@ def run_visualization(args):
     all_clogging_pairs = []  # List of (actual, predicted) tuples for scatter plot
     all_clogging_errors = []  # List of absolute errors for error bar chart
     all_actual_values = []  # List of actual clogging extent values
+    all_amodal_predictions = []  # List of dicts with image_id, image_filename, and amodal_masks
 
     from detectron2.structures import Boxes, pairwise_iou
     import torch
@@ -910,6 +1030,38 @@ def run_visualization(args):
                        "width": image_bgr.shape[1]}]
             outputs = model(inputs)
         instances = outputs[0]["instances"].to("cpu")
+
+        # Extract amodal mask predictions for ALL instances
+        # This is independent of clogging_extent or other fields
+        if len(instances) > 0 and instances.has("pred_masks_amodal"):
+            amodal_masks = (instances.pred_masks_amodal.numpy() > 0.5)
+            pred_boxes = instances.pred_boxes.tensor.numpy()
+            
+            amodal_masks_list = []
+            for inst_idx in range(len(instances)):
+                polygons = mask_to_polygon_coords(
+                    amodal_masks[inst_idx], 
+                    pred_boxes[inst_idx], 
+                    image_bgr.shape[:2]
+                )
+                
+                # Only add if we got valid polygons
+                if polygons:
+                    for poly_idx, poly in enumerate(polygons):
+                        amodal_masks_list.append({
+                            "instance_index": inst_idx,
+                            "polygon": poly
+                        })
+            
+            # Store prediction if we have any masks
+            if amodal_masks_list:
+                all_amodal_predictions.append({
+                    "image_id": int(record.get("image_id", idx)),
+                    "image_filename": os.path.basename(record["file_name"]),
+                    "height": int(image_bgr.shape[0]),
+                    "width": int(image_bgr.shape[1]),
+                    "amodal_masks": amodal_masks_list
+                })
 
         # Extract ground-truth annotations from the record
         gt_anns = record.get("annotations", [])
@@ -1025,10 +1177,15 @@ def run_visualization(args):
     error_bar_path = os.path.join(out_dir, "clogging_error_bars.png")
     plot_clogging_error_bars(all_clogging_errors, all_actual_values, error_bar_path, num_bins=4)
 
+    # Save amodal predictions to JSON
+    amodal_json_path = os.path.join(out_dir, "amodal_segmentation_predictions.json")
+    save_amodal_predictions_to_json(all_amodal_predictions, amodal_json_path)
+
     logger.info(f"\n✓ Done.")
     logger.info(f"  • {len(all_viz_images)} images visualized")
     logger.info(f"  • {num_collages} collage(s) created")
     logger.info(f"  • {len(all_clogging_pairs)} clogging predictions included in plots")
+    logger.info(f"  • {len(all_amodal_predictions)} images with amodal masks saved to JSON")
     logger.info(f"  Outputs saved to: {out_dir}")
 
 
@@ -1041,10 +1198,10 @@ class ConfigArgs:
     base_dir = "/run/user/1000/gvfs/smb-share:server=ecresearch.uwaterloo.ca,share=cviss/Jack/baf/360streetview"
 
     # Path to the test COCO JSON (same format as synthetic.json)
-    test_json = os.path.join(base_dir, "segmentation_training", "synthetic_v2", "synthetic.json")
+    test_json = os.path.join(base_dir, "segmentation_training", "clogged_inlets", "clogged.json")
 
     # Path to the directory containing the test images
-    test_imgs = os.path.join(base_dir, "segmentation_training", "synthetic_v2", "images")
+    test_imgs = os.path.join(base_dir, "segmentation_training", "clogged_inlets", "images")
 
     # Directory containing fold_0/model_final.pth … fold_4/model_final.pth
     trained_models_dir = os.path.join(base_dir, "trained_models", "synthetic_final")
